@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DXF Nester</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect x='8' y='8' width='84' height='84' rx='10' fill='%230f766e'/><rect x='18' y='18' width='30' height='40' rx='4' fill='%23f0fdfa'/><rect x='54' y='18' width='28' height='22' rx='4' fill='%2399f6e4'/><circle cx='68' cy='66' r='14' fill='%235eead4'/></svg>" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <header>
+          <h1>DXF Nester</h1>
+          <p class="sub">Nest DXF parts onto the smallest sheet — in your browser.</p>
+        </header>
+
+        <div id="drop" class="drop" tabindex="0">
+          <strong>Drop DXF files here</strong>
+          <span>or click to browse · <a id="demo-link" href="#">load demo parts</a></span>
+          <input id="file-input" type="file" accept=".dxf,application/dxf" multiple hidden />
+        </div>
+
+        <section id="parts-section" hidden>
+          <div class="section-head">
+            <h2>Parts <span id="part-count" class="badge"></span></h2>
+            <button id="clear-parts" class="ghost" title="Remove all parts">Clear</button>
+          </div>
+          <ul id="parts-list"></ul>
+        </section>
+
+        <section>
+          <h2>Nesting settings</h2>
+
+          <label class="row">
+            <span>Spacing between parts <em class="hint">0 = touching / common line</em></span>
+            <span class="unit-wrap"><input id="opt-gap" type="number" min="0" step="0.5" value="2" /><i>u</i></span>
+          </label>
+
+          <label class="row checkbox" id="merge-row">
+            <input id="opt-merge" type="checkbox" />
+            <span>Merge coincident cut lines on export <em class="hint">for spacing 0 — deduplicates shared edges</em></span>
+          </label>
+
+          <label class="row">
+            <span>Part grouping</span>
+            <select id="opt-grouping">
+              <option value="auto" selected>Auto — closed loops, contained loops become holes</option>
+              <option value="layer">By layer — one rigid part per layer</option>
+              <option value="loop">Each closed loop separately (no holes)</option>
+              <option value="entity">Each entity separately</option>
+            </select>
+          </label>
+
+          <label class="row">
+            <span>Allowed rotations</span>
+            <select id="opt-rotation">
+              <option value="0">None (keep orientation)</option>
+              <option value="90" selected>90° steps</option>
+              <option value="45">45° steps</option>
+              <option value="30">30° steps</option>
+              <option value="15">15° steps</option>
+            </select>
+          </label>
+
+          <label class="row checkbox">
+            <input id="opt-mirror" type="checkbox" />
+            <span>Allow mirrored placement <em class="hint">only if both faces of the material are equivalent</em></span>
+          </label>
+
+          <label class="row">
+            <span>Sheet / workpiece</span>
+            <select id="opt-sheet-mode">
+              <option value="auto" selected>Auto — smallest bounding area</option>
+              <option value="width">Fixed width, unlimited length</option>
+              <option value="wh">Fixed size (multiple sheets if needed)</option>
+            </select>
+          </label>
+
+          <div class="row pair" id="sheet-dims">
+            <label><span>Width</span><span class="unit-wrap"><input id="opt-sheet-w" type="number" min="1" step="10" value="1000" /><i>u</i></span></label>
+            <label><span>Height</span><span class="unit-wrap"><input id="opt-sheet-h" type="number" min="1" step="10" value="500" /><i>u</i></span></label>
+          </div>
+
+          <label class="row">
+            <span>Sheet edge margin</span>
+            <span class="unit-wrap"><input id="opt-margin" type="number" min="0" step="0.5" value="0" /><i>u</i></span>
+          </label>
+
+          <details>
+            <summary>Advanced</summary>
+            <label class="row">
+              <span>Nesting resolution <em class="hint">grid size; empty = auto. Smaller = tighter but slower</em></span>
+              <span class="unit-wrap"><input id="opt-resolution" type="number" min="0.001" step="0.1" placeholder="auto" /><i>u/px</i></span>
+            </label>
+            <label class="row">
+              <span>Join tolerance <em class="hint">max endpoint gap when chaining entities into loops</em></span>
+              <span class="unit-wrap"><input id="opt-join-tol" type="number" min="0" step="0.01" value="0.01" /><i>u</i></span>
+            </label>
+            <label class="row">
+              <span>Curve tolerance <em class="hint">max deviation when flattening arcs/splines</em></span>
+              <span class="unit-wrap"><input id="opt-curve-tol" type="number" min="0.001" step="0.01" value="0.05" /><i>u</i></span>
+            </label>
+            <label class="row">
+              <span>Merge tolerance <em class="hint">max distance for two cut lines to count as coincident</em></span>
+              <span class="unit-wrap"><input id="opt-merge-tol" type="number" min="0" step="0.01" value="0.05" /><i>u</i></span>
+            </label>
+          </details>
+        </section>
+
+        <div class="actions">
+          <button id="nest-btn" class="primary" disabled>Nest parts</button>
+          <button id="cancel-btn" hidden>Cancel</button>
+          <progress id="nest-progress" max="1" value="0" hidden></progress>
+        </div>
+
+        <section id="result-section" hidden>
+          <h2>Result</h2>
+          <div id="stats" class="stats"></div>
+          <button id="download-btn" class="primary">Download nested DXF</button>
+        </section>
+
+        <div id="messages"></div>
+
+        <footer>
+          <p>Everything runs locally — files never leave your browser. <br />u = drawing units of your DXF.</p>
+        </footer>
+      </aside>
+
+      <main id="viewport">
+        <div id="tabs">
+          <button id="tab-parts" class="tab active">Parts</button>
+          <button id="tab-nested" class="tab" disabled>Nested</button>
+          <span id="view-hint">scroll to zoom · drag to pan</span>
+        </div>
+        <canvas id="view"></canvas>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
