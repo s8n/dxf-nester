@@ -212,6 +212,24 @@ describe('nest', () => {
     }
   })
 
+  it('balances parts across fixed sheets when that nests tighter per sheet', () => {
+    // 2x 70x70 and 4x 30x30 on 102x102 sheets, gap 0. Greedy top-up crams one 70
+    // plus all four 30s onto sheet 1 (used ~100x100) and strands the second 70
+    // alone on sheet 2. Splitting evenly (one 70 + two 30s per sheet) uses only
+    // ~100x70 per sheet, so the balanced pass must win the used-area tiebreak
+    // at equal sheet count.
+    const parts = [rectPart(1, 70, 70, 2), rectPart(2, 30, 30, 4)]
+    const res = nest(parts, { ...baseOpts, gap: 0, resolution: 0.25, sheetWidth: 102, sheetHeight: 102 })
+    expect(res.failures).toHaveLength(0)
+    expect(res.placements).toHaveLength(6)
+    expect(res.sheets.length).toBe(2)
+    for (const si of [0, 1]) {
+      const onSheet = res.placements.filter((p) => p.sheet === si)
+      expect(onSheet.filter((p) => p.partId === 1)).toHaveLength(1)
+      expect(onSheet.filter((p) => p.partId === 2)).toHaveLength(2)
+    }
+  })
+
   it('reports parts too big for the workpiece', () => {
     const parts = [rectPart(1, 100, 100)]
     const res = nest(parts, { ...baseOpts, sheetWidth: 50, sheetHeight: 50 })

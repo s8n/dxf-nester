@@ -192,6 +192,8 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
     sheets: SheetInfo[]
     placedArea: number
     stockArea: number
+    /** Sum of per-sheet used bounding areas — lower = more compact nests, bigger offcuts. */
+    usedArea: number
     failures: Set<number>
   }
 
@@ -201,7 +203,7 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
     ...orders.map((order) => ({ order, policy: 'contact' as Policy })),
     { order: instances, policy: 'bl' as Policy },
   ]
-  const total = instances.length * passes.length
+  let total = instances.length * passes.length
   let done = 0
 
   interface PlacedItem {
@@ -290,16 +292,31 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
     return sheetBest
   }
 
-  const runPass = (order: NestPart[], policy: Policy): Pass => {
+  // With `assign`, the pass distributes work across a fixed pool of sheets:
+  // assign[i] is the sheet order[i] should land on (fallback: any sheet that
+  // fits). Without it, earlier sheets win outright so partially filled stock
+  // gets topped up first.
+  const runPass = (order: NestPart[], policy: Policy, assign?: number[]): Pass => {
     const sheets: Sheet[] = []
+    if (assign) {
+      let pool = 0
+      for (const si of assign) pool = Math.max(pool, si + 1)
+      while (sheets.length < pool) sheets.push(newSheet())
+    }
     const items: PlacedItem[] = []
     const failures = new Set<number>()
     let placedArea = 0
 
-    for (const p of order) {
+    for (let oi = 0; oi < order.length; oi++) {
+      const p = order[oi]
       let best: { sheet: number; mask: Mask; x: number; y: number } | null = null
-      // Earlier sheets win outright so partially filled stock gets topped up first.
+      const target = assign?.[oi]
+      if (target != null && target < sheets.length) {
+        const found = bestOnSheet(p, sheets[target], policy)
+        if (found) best = { sheet: target, ...found }
+      }
       for (let si = 0; si < sheets.length && !best; si++) {
+        if (si === target) continue
         const found = bestOnSheet(p, sheets[si], policy)
         if (found) best = { sheet: si, ...found }
       }
@@ -334,39 +351,77 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
       sheet.usedHU = Math.max(sheet.usedHU, margin + it.y * res + it.mask.hU)
       sheet.placed++
     }
+    // Drop sheets that ended up empty (possible with `assign`) and renumber.
+    const remap = new Map<number, number>()
+    const liveSheets = sheets.filter((s, i) => {
+      if (s.placed === 0) return false
+      remap.set(i, remap.size)
+      return true
+    })
     const placements: Placement[] = items.map((it) => ({
       partId: it.p.id,
-      sheet: it.sheet,
+      sheet: remap.get(it.sheet)!,
       theta: it.mask.theta,
       mirror: it.mask.mirror,
       tx: margin + it.x * res - it.mask.offX,
       ty: margin + it.y * res - it.mask.offY,
     }))
 
-    const sheetInfos: SheetInfo[] = sheets.map((s) => ({
+    const sheetInfos: SheetInfo[] = liveSheets.map((s) => ({
       usedW: s.usedWU + margin,
       usedH: s.usedHU + margin,
       placed: s.placed,
     }))
     let stockArea = 0
+    let usedArea = 0
     for (const s of sheetInfos) {
       stockArea += sheetH != null ? sheetW * sheetH : (opts.sheetWidth != null ? sheetW : s.usedW) * s.usedH
+      usedArea += s.usedW * s.usedH
     }
-    return { placements, sheets: sheetInfos, placedArea, stockArea, failures }
+    return { placements, sheets: sheetInfos, placedArea, stockArea, usedArea, failures }
   }
 
-  // More parts placed > fewer sheets > less stock consumed. Ties keep the earlier
-  // (plain biggest-first) pass.
+  // More parts placed > fewer sheets > less stock consumed > tighter per-sheet
+  // nests. The used-area tiebreak matters for fixed-size sheets, where every
+  // layout with the same sheet count consumes the same stock: preferring compact
+  // per-sheet bounding boxes keeps each sheet's leftover a large usable offcut.
+  // Ties keep the earlier (plain biggest-first) pass.
   const better = (a: Pass, b: Pass): boolean => {
     if (a.placements.length !== b.placements.length) return a.placements.length > b.placements.length
     if (a.sheets.length !== b.sheets.length) return a.sheets.length < b.sheets.length
-    return a.stockArea < b.stockArea - 1e-9
+    if (Math.abs(a.stockArea - b.stockArea) > 1e-9) return a.stockArea < b.stockArea
+    return a.usedArea < b.usedArea - 1e-9
   }
 
   let best = runPass(passes[0].order, passes[0].policy)
   for (let i = 1; i < passes.length; i++) {
     const pass = runPass(passes[i].order, passes[i].policy)
     if (better(pass, best)) best = pass
+  }
+
+  // Greedy top-up fills early sheets with whatever fits, which can strand an
+  // awkward remainder (e.g. all the bulky solids on sheet 1, all the sparse
+  // frames on sheet 2). When several fixed-size sheets are needed anyway,
+  // additionally try balanced distributions: pre-open that many sheets and
+  // spread the instances across them by area (each to the least-loaded sheet,
+  // in placement order), so complementary shapes can pair up on every sheet.
+  const wantSheets = best.sheets.length
+  if (sheetH != null && wantSheets > 1 && instances.length > wantSheets && best.failures.size === 0) {
+    const balanced = orders.map((order) => {
+      const load = new Array<number>(wantSheets).fill(0)
+      const assign = order.map((p) => {
+        let si = 0
+        for (let k = 1; k < wantSheets; k++) if (load[k] < load[si]) si = k
+        load[si] += p.area
+        return si
+      })
+      return { order, assign }
+    })
+    total += instances.length * balanced.length
+    for (const { order, assign } of balanced) {
+      const pass = runPass(order, 'contact', assign)
+      if (better(pass, best)) best = pass
+    }
   }
 
   return {
