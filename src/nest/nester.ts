@@ -79,6 +79,11 @@ interface Sheet {
 
 export type ProgressFn = (done: number, total: number) => void
 
+/** Empty bbox space inside a part (pockets, concavities, holes) other parts could nest into. */
+function voidArea(p: NestPart): number {
+  return Math.max(0, p.width * p.height - p.area)
+}
+
 export function nest(parts: NestPart[], opts: NestOptions, onProgress?: ProgressFn): NestResult {
   const usable = parts.filter((p) => p.count > 0 && (p.rings.length > 0 || p.opens.length > 0))
   const rotations: number[] = [0]
@@ -132,6 +137,31 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
   for (const p of usable) for (let i = 0; i < p.count; i++) instances.push(p)
   instances.sort((a, b) => b.area - a.area || Math.max(b.width, b.height) - Math.max(a.width, a.height))
 
+  // Placement order strategies. Beyond plain biggest-first, mostly-empty parts
+  // (C-channels, frames, brackets — more void than material inside their bbox) are
+  // promoted so later parts can nest into their pockets and concavities: the pocket
+  // has to exist before it can be filled, but area order alone places such
+  // containers last since their material area is small. Leading with only 1-2
+  // containers keeps their pockets available for the big parts that follow instead
+  // of letting the containers interlock with each other first; each candidate
+  // ordering runs a full greedy pass and the best result wins.
+  const orders: NestPart[][] = [instances]
+  const isContainer = (p: NestPart) => voidArea(p) >= p.area
+  const containers = usable.filter(isContainer)
+  const couldNest = containers.some(
+    (c) => c.count > 1 || usable.some((p) => p !== c && p.area <= voidArea(c))
+  )
+  if (instances.length > 1 && couldNest) {
+    // instances is area-sorted, so these keep biggest-first within each class.
+    const contList = instances.filter(isContainer)
+    const nonList = instances.filter((p) => !isContainer(p))
+    const leads = [...new Set([contList.length, 1, 2])].filter((k) => k >= 1 && k <= contList.length)
+    for (const k of leads) {
+      const order = [...contList.slice(0, k), ...nonList, ...contList.slice(k)]
+      if (orders.every((o) => order.some((p, i) => p !== o[i]))) orders.push(order)
+    }
+  }
+
   const maskCache = new Map<string, Mask | null>()
   const getMask = (p: NestPart, rot: number, mir: boolean): Mask | null => {
     const key = `${p.id}|${rot}|${mir}`
@@ -143,97 +173,125 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
     return m
   }
 
-  const sheets: Sheet[] = []
-  const newSheet = (): Sheet => {
-    const s: Sheet = { occ: new BitGrid(innerW + 2 * PAD, 128), topNest: 0, usedWU: 0, usedHU: 0, placed: 0 }
-    sheets.push(s)
-    return s
+  interface Pass {
+    placements: Placement[]
+    sheets: SheetInfo[]
+    placedArea: number
+    stockArea: number
+    failures: Set<number>
   }
 
-  const placements: Placement[] = []
-  const failures = new Set<number>()
-  let placedArea = 0
+  const total = instances.length * orders.length
   let done = 0
 
-  // Best bottom-left position for any allowed orientation of p on one sheet.
-  const bestOnSheet = (p: NestPart, si: number): { mask: Mask; x: number; y: number } | null => {
-    let sheetBest: { mask: Mask; x: number; y: number } | null = null
-    for (const mir of mirrors) {
-      for (const rot of rotations) {
-        const mask = getMask(p, rot, mir)
-        if (!mask) continue
-        const pos = findFit(sheets[si], mask, innerW, innerH, PAD)
-        if (pos && (!sheetBest || pos.y < sheetBest.y || (pos.y === sheetBest.y && pos.x < sheetBest.x))) {
-          sheetBest = { mask, x: pos.x, y: pos.y }
+  const runPass = (order: NestPart[]): Pass => {
+    const sheets: Sheet[] = []
+    const newSheet = (): Sheet => {
+      const s: Sheet = { occ: new BitGrid(innerW + 2 * PAD, 128), topNest: 0, usedWU: 0, usedHU: 0, placed: 0 }
+      sheets.push(s)
+      return s
+    }
+
+    const placements: Placement[] = []
+    const failures = new Set<number>()
+    let placedArea = 0
+
+    // Best bottom-left position for any allowed orientation of p on one sheet.
+    const bestOnSheet = (p: NestPart, si: number): { mask: Mask; x: number; y: number } | null => {
+      let sheetBest: { mask: Mask; x: number; y: number } | null = null
+      for (const mir of mirrors) {
+        for (const rot of rotations) {
+          const mask = getMask(p, rot, mir)
+          if (!mask) continue
+          const pos = findFit(sheets[si], mask, innerW, innerH, PAD)
+          if (pos && (!sheetBest || pos.y < sheetBest.y || (pos.y === sheetBest.y && pos.x < sheetBest.x))) {
+            sheetBest = { mask, x: pos.x, y: pos.y }
+          }
         }
       }
+      return sheetBest
     }
-    return sheetBest
-  }
 
-  for (const p of instances) {
-    let best: { sheet: number; mask: Mask; x: number; y: number } | null = null
-    // Earlier sheets win outright so partially filled stock gets topped up first.
-    for (let si = 0; si < sheets.length && !best; si++) {
-      const found = bestOnSheet(p, si)
-      if (found) best = { sheet: si, ...found }
-    }
-    if (!best) {
-      let fitsEmpty = false
-      for (const mir of mirrors) for (const rot of rotations) if (getMask(p, rot, mir)) fitsEmpty = true
-      if (fitsEmpty) {
-        const si = sheets.length
-        newSheet()
+    for (const p of order) {
+      let best: { sheet: number; mask: Mask; x: number; y: number } | null = null
+      // Earlier sheets win outright so partially filled stock gets topped up first.
+      for (let si = 0; si < sheets.length && !best; si++) {
         const found = bestOnSheet(p, si)
         if (found) best = { sheet: si, ...found }
       }
       if (!best) {
-        failures.add(p.id)
-        done++
-        onProgress?.(done, instances.length)
-        continue
+        let fitsEmpty = false
+        for (const mir of mirrors) for (const rot of rotations) if (getMask(p, rot, mir)) fitsEmpty = true
+        if (fitsEmpty) {
+          const si = sheets.length
+          newSheet()
+          const found = bestOnSheet(p, si)
+          if (found) best = { sheet: si, ...found }
+        }
+        if (!best) {
+          failures.add(p.id)
+          done++
+          onProgress?.(done, total)
+          continue
+        }
       }
+
+      const sheet = sheets[best.sheet]
+      const mask = best.mask
+      if (!mask.dilated) mask.dilated = dilate(mask.grid, gapPx)
+      // Occupancy coords are nest coords + PAD; the dilated stamp cancels the pad.
+      orInto(sheet.occ, mask.dilated, best.x, best.y)
+      sheet.topNest = Math.max(sheet.topNest, best.y + mask.h + gapPx)
+      sheet.usedWU = Math.max(sheet.usedWU, margin + best.x * res + mask.wU)
+      sheet.usedHU = Math.max(sheet.usedHU, margin + best.y * res + mask.hU)
+      sheet.placed++
+      placements.push({
+        partId: p.id,
+        sheet: best.sheet,
+        theta: mask.theta,
+        mirror: mask.mirror,
+        tx: margin + best.x * res - mask.offX,
+        ty: margin + best.y * res - mask.offY,
+      })
+      placedArea += p.area
+      done++
+      onProgress?.(done, total)
     }
 
-    const sheet = sheets[best.sheet]
-    const mask = best.mask
-    if (!mask.dilated) mask.dilated = dilate(mask.grid, gapPx)
-    // Occupancy coords are nest coords + PAD; the dilated stamp cancels the pad.
-    orInto(sheet.occ, mask.dilated, best.x, best.y)
-    sheet.topNest = Math.max(sheet.topNest, best.y + mask.h + gapPx)
-    sheet.usedWU = Math.max(sheet.usedWU, margin + best.x * res + mask.wU)
-    sheet.usedHU = Math.max(sheet.usedHU, margin + best.y * res + mask.hU)
-    sheet.placed++
-    placements.push({
-      partId: p.id,
-      sheet: best.sheet,
-      theta: mask.theta,
-      mirror: mask.mirror,
-      tx: margin + best.x * res - mask.offX,
-      ty: margin + best.y * res - mask.offY,
-    })
-    placedArea += p.area
-    done++
-    onProgress?.(done, instances.length)
+    const sheetInfos: SheetInfo[] = sheets.map((s) => ({
+      usedW: s.usedWU + margin,
+      usedH: s.usedHU + margin,
+      placed: s.placed,
+    }))
+    let stockArea = 0
+    for (const s of sheetInfos) {
+      stockArea += sheetH != null ? sheetW * sheetH : (opts.sheetWidth != null ? sheetW : s.usedW) * s.usedH
+    }
+    return { placements, sheets: sheetInfos, placedArea, stockArea, failures }
   }
 
-  const sheetInfos: SheetInfo[] = sheets.map((s) => ({
-    usedW: s.usedWU + margin,
-    usedH: s.usedHU + margin,
-    placed: s.placed,
-  }))
-  let stockArea = 0
-  for (const s of sheetInfos) {
-    stockArea += sheetH != null ? sheetW * sheetH : (opts.sheetWidth != null ? sheetW : s.usedW) * s.usedH
+  // More parts placed > fewer sheets > less stock consumed. Ties keep the earlier
+  // (plain biggest-first) pass.
+  const better = (a: Pass, b: Pass): boolean => {
+    if (a.placements.length !== b.placements.length) return a.placements.length > b.placements.length
+    if (a.sheets.length !== b.sheets.length) return a.sheets.length < b.sheets.length
+    return a.stockArea < b.stockArea - 1e-9
   }
+
+  let best = runPass(orders[0])
+  for (let i = 1; i < orders.length; i++) {
+    const pass = runPass(orders[i])
+    if (better(pass, best)) best = pass
+  }
+
   return {
-    placements,
-    sheets: sheetInfos,
+    placements: best.placements,
+    sheets: best.sheets,
     sheetW,
     sheetH: sheetH ?? null,
     resolution: res,
-    utilization: stockArea > 0 ? placedArea / stockArea : 0,
-    failures: [...failures],
+    utilization: best.stockArea > 0 ? best.placedArea / best.stockArea : 0,
+    failures: [...best.failures],
   }
 }
 
@@ -306,7 +364,9 @@ function buildMask(p: NestPart, theta: number, mirror: boolean, scale: number): 
 }
 
 /**
- * Bottom-left first fit: scan upward, coarse stride first, then refine the band.
+ * Bottom-left first fit: scan upward with a coarse row stride, then refine the band.
+ * Rows are scanned exhaustively in x (collide exits early on occupied spots), so
+ * narrow slots — e.g. a snug pocket inside another part — are not skipped over.
  * Returns nest-space pixel coords, or null if the mask cannot fit (height limit).
  */
 function findFit(sheet: Sheet, mask: Mask, innerW: number, innerH: number | null, PAD: number): { x: number; y: number } | null {
@@ -319,11 +379,10 @@ function findFit(sheet: Sheet, mask: Mask, innerW: number, innerH: number | null
   const occ = sheet.occ
   for (let y = 0; y <= scanTop; y += st) {
     occ.ensureRows(y + PAD + mask.h)
-    for (let x = 0; x <= maxX; x += st) {
+    for (let x = 0; x <= maxX; x++) {
       if (!collide(occ, mask.grid, x + PAD, y + PAD)) {
-        // Found a band with room — refine to the lowest-left position inside it.
-        const y0 = Math.max(0, y - st + 1)
-        for (let fy = y0; fy <= y; fy++) {
+        // Found room in this band — refine to the lowest-left position inside it.
+        for (let fy = Math.max(0, y - st + 1); fy < y; fy++) {
           for (let fx = 0; fx <= maxX; fx++) {
             if (!collide(occ, mask.grid, fx + PAD, fy + PAD)) return { x: fx, y: fy }
           }

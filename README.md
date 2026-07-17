@@ -41,8 +41,10 @@ drawing units of your DXF.
     opened). Sheets are laid side by side in the preview and the exported DXF.
 - **Rotations** (none / 90° / 45° / 30° / 15° steps) and optional **mirrored**
   placement.
-- **Hole nesting** — small parts are placed inside the holes of bigger parts when they
-  fit (spacing respected).
+- **Nesting inside parts** — parts are placed inside the holes, pockets and
+  concavities of other parts when they fit (spacing respected). Works for open
+  profiles too: a part may protrude through the opening of a C-channel while its body
+  sits in the pocket.
 - **Sheet margin**, per-part **quantities**, live progress with cancel (nesting runs in
   a Web Worker), pan/zoom preview, utilization stats.
 
@@ -59,12 +61,18 @@ Original layers are preserved.
 
 ## How the nesting works
 
-Parts are rasterized onto a bitset grid (with holes kept open, plus a conservative
-1-pixel outline so thin features never vanish), sorted by area, and placed greedily
+Parts are rasterized onto a bitset grid (with holes and pockets kept open, plus a
+conservative 1-pixel outline so thin features never vanish) and placed greedily
 bottom-left, trying every allowed orientation and keeping the lowest position. Spacing
 is enforced by morphologically dilating each placed part's footprint before stamping it
 into the occupancy grid — so clearances hold for concave shapes and holes too, not just
 bounding boxes.
+
+Several placement orders are tried and the best result wins: plain biggest-first, plus
+orders that promote "container" parts (more empty bbox space than material — C-channels,
+frames, brackets) so their pockets exist before the parts that could fill them are
+placed. Leading with only one or two containers is also tried, which keeps pockets
+available for big parts instead of letting containers interlock with each other first.
 
 Accuracy is bounded by the **nesting resolution** (auto-chosen from sheet and part
 sizes, overridable under *Advanced*): placements are accurate to about one grid cell.

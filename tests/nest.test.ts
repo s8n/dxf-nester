@@ -138,6 +138,49 @@ describe('nest', () => {
     expect(b.maxY).toBeLessThan(rb.maxY - 4)
   })
 
+  it('nests parts inside the pocket of a C-shaped part', () => {
+    // C-channel: 100x60 outer, 10-thick walls and floor -> 80x50 pocket open at the
+    // top. Two bars stand inside the pocket, protruding through the opening. Area
+    // order alone would place the (heavier) bars first and the channel on top.
+    const channel: NestPart = {
+      id: 1,
+      rings: [
+        [
+          { x: 0, y: 0 },
+          { x: 100, y: 0 },
+          { x: 100, y: 60 },
+          { x: 90, y: 60 },
+          { x: 90, y: 10 },
+          { x: 10, y: 10 },
+          { x: 10, y: 60 },
+          { x: 0, y: 60 },
+        ],
+      ],
+      opens: [],
+      width: 100,
+      height: 60,
+      area: 100 * 60 - 80 * 50,
+      count: 1,
+    }
+    const bar = rectPart(2, 36, 80, 2)
+    const res = nest([channel, bar], { ...baseOpts, resolution: 0.25, sheetWidth: 120 })
+    expect(res.failures).toHaveLength(0)
+    expect(res.placements).toHaveLength(3)
+    // Bars stand inside the pocket -> the whole nest stays below y=100. Without
+    // in-part nesting the channel has to sit above the bars (y >= 136).
+    expect(res.sheets[0].usedH).toBeLessThan(100)
+    const chPl = res.placements.find((p) => p.partId === 1)!
+    const chBox = placedBBox(channel, chPl)
+    for (const pl of res.placements.filter((p) => p.partId === 2)) {
+      const b = placedBBox(bar, pl)
+      // Each bar overlaps the channel's bbox substantially: it is inside the pocket.
+      const ovX = Math.min(b.maxX, chBox.maxX) - Math.max(b.minX, chBox.minX)
+      const ovY = Math.min(b.maxY, chBox.maxY) - Math.max(b.minY, chBox.minY)
+      expect(ovX).toBeGreaterThan(30)
+      expect(ovY).toBeGreaterThan(30)
+    }
+  })
+
   it('splits across multiple sheets when a workpiece size is set', () => {
     const parts = [rectPart(1, 30, 30, 5)]
     const res = nest(parts, { ...baseOpts, sheetWidth: 40, sheetHeight: 40, gap: 2 })
