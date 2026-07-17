@@ -1,5 +1,5 @@
 import type { Pt } from '../geom'
-import { BitGrid, collide, dilate, orInto, rasterize } from './raster'
+import { BitGrid, collide, dilate, orInto, overlapCount, rasterize } from './raster'
 
 export interface NestPart {
   id: number
@@ -66,10 +66,16 @@ interface Mask {
   theta: number
   mirror: boolean
   dilated: BitGrid | null
+  /** Mask dilated by gap+1 px: the "contact zone" stamped into Sheet.occC. */
+  dilatedC: BitGrid | null
 }
 
 interface Sheet {
   occ: BitGrid
+  /** Contact zones (stamps dilated one px past the gap, plus sheet edges). */
+  occC: BitGrid
+  /** Rows of occC whose edge columns have been marked so far. */
+  contactRows: number
   /** First empty nest-space row (px): all rows >= topNest are guaranteed free. */
   topNest: number
   usedWU: number
@@ -83,6 +89,14 @@ export type ProgressFn = (done: number, total: number) => void
 function voidArea(p: NestPart): number {
   return Math.max(0, p.width * p.height - p.area)
 }
+
+/**
+ * Position-selection policy for a placement pass. 'bl' is classic bottom-left.
+ * 'contact' prefers the orientation whose fit touches the most existing material
+ * or sheet edge ("touching perimeter"), which snugs parts into pockets and
+ * corners instead of starting fresh columns.
+ */
+type Policy = 'bl' | 'contact'
 
 export function nest(parts: NestPart[], opts: NestOptions, onProgress?: ProgressFn): NestResult {
   const usable = parts.filter((p) => p.count > 0 && (p.rings.length > 0 || p.opens.length > 0))
@@ -181,51 +195,121 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
     failures: Set<number>
   }
 
-  const total = instances.length * orders.length
+  // Contact-scored passes over every candidate order, plus one classic bottom-left
+  // pass on the plain order as a safety net for shapes where snug placement loses.
+  const passes: { order: NestPart[]; policy: Policy }[] = [
+    ...orders.map((order) => ({ order, policy: 'contact' as Policy })),
+    { order: instances, policy: 'bl' as Policy },
+  ]
+  const total = instances.length * passes.length
   let done = 0
 
-  const runPass = (order: NestPart[]): Pass => {
-    const sheets: Sheet[] = []
-    const newSheet = (): Sheet => {
-      const s: Sheet = { occ: new BitGrid(innerW + 2 * PAD, 128), topNest: 0, usedWU: 0, usedHU: 0, placed: 0 }
-      sheets.push(s)
-      return s
+  interface PlacedItem {
+    p: NestPart
+    mask: Mask
+    x: number
+    y: number
+    sheet: number
+  }
+
+  // The contact grid uses one extra pad pixel so a mask's cells can coincide with
+  // zones dilated one px past the gap: overlap there = "touching across the gap".
+  const PADC = PAD + 1
+
+  const newSheet = (): Sheet => {
+    const occC = new BitGrid(innerW + 2 * PADC, 128)
+    // Sheet floor counts as contact.
+    for (let y = 0; y <= PADC; y++) occC.fillSpan(y, 0, occC.w - 1)
+    return {
+      occ: new BitGrid(innerW + 2 * PAD, 128),
+      occC,
+      contactRows: 0,
+      topNest: 0,
+      usedWU: 0,
+      usedHU: 0,
+      placed: 0,
     }
+  }
 
-    const placements: Placement[] = []
-    const failures = new Set<number>()
-    let placedArea = 0
+  // Keep occC's left/right sheet-edge columns marked as rows grow.
+  const ensureContact = (sheet: Sheet, rows: number): void => {
+    const g = sheet.occC
+    g.ensureRows(rows)
+    if (sheet.contactRows < g.h) {
+      for (let y = sheet.contactRows; y < g.h; y++) {
+        g.fillSpan(y, 0, PADC)
+        g.fillSpan(y, PADC + innerW - 1, g.w - 1)
+      }
+      sheet.contactRows = g.h
+    }
+  }
 
-    // Best bottom-left position for any allowed orientation of p on one sheet.
-    const bestOnSheet = (p: NestPart, si: number): { mask: Mask; x: number; y: number } | null => {
-      let sheetBest: { mask: Mask; x: number; y: number } | null = null
-      for (const mir of mirrors) {
-        for (const rot of rotations) {
-          const mask = getMask(p, rot, mir)
-          if (!mask) continue
-          const pos = findFit(sheets[si], mask, innerW, innerH, PAD)
-          if (pos && (!sheetBest || pos.y < sheetBest.y || (pos.y === sheetBest.y && pos.x < sheetBest.x))) {
+  /** Touching-perimeter score: mask cells within one px of placed material or a sheet edge. */
+  const contactAt = (sheet: Sheet, mask: Mask, x: number, y: number): number => {
+    ensureContact(sheet, y + PADC + mask.h)
+    return overlapCount(sheet.occC, mask.grid, x + PADC, y + PADC)
+  }
+
+  const stamp = (sheet: Sheet, mask: Mask, x: number, y: number, policy: Policy): void => {
+    if (!mask.dilated) mask.dilated = dilate(mask.grid, gapPx)
+    // Occupancy coords are nest coords + PAD; the dilated stamp cancels the pad.
+    orInto(sheet.occ, mask.dilated, x, y)
+    sheet.topNest = Math.max(sheet.topNest, y + mask.h + gapPx)
+    if (policy === 'contact') {
+      if (!mask.dilatedC) mask.dilatedC = dilate(mask.grid, gapPx + 1)
+      ensureContact(sheet, y + mask.dilatedC.h)
+      orInto(sheet.occC, mask.dilatedC, x, y)
+    }
+  }
+
+  const posBetter = (y: number, x: number, cur: { y: number; x: number }): boolean =>
+    y < cur.y || (y === cur.y && x < cur.x)
+
+  // Best position for any allowed orientation of p on one sheet: the policy picks
+  // among each orientation's lowest-left fit.
+  const bestOnSheet = (p: NestPart, sheet: Sheet, policy: Policy): { mask: Mask; x: number; y: number } | null => {
+    let sheetBest: { mask: Mask; x: number; y: number } | null = null
+    let bestContact = -1
+    for (const mir of mirrors) {
+      for (const rot of rotations) {
+        const mask = getMask(p, rot, mir)
+        if (!mask) continue
+        const pos = findFit(sheet, mask, innerW, innerH, PAD)
+        if (!pos) continue
+        if (policy === 'contact') {
+          const c = contactAt(sheet, mask, pos.x, pos.y)
+          if (!sheetBest || c > bestContact || (c === bestContact && posBetter(pos.y, pos.x, sheetBest))) {
             sheetBest = { mask, x: pos.x, y: pos.y }
+            bestContact = c
           }
+        } else if (!sheetBest || posBetter(pos.y, pos.x, sheetBest)) {
+          sheetBest = { mask, x: pos.x, y: pos.y }
         }
       }
-      return sheetBest
     }
+    return sheetBest
+  }
+
+  const runPass = (order: NestPart[], policy: Policy): Pass => {
+    const sheets: Sheet[] = []
+    const items: PlacedItem[] = []
+    const failures = new Set<number>()
+    let placedArea = 0
 
     for (const p of order) {
       let best: { sheet: number; mask: Mask; x: number; y: number } | null = null
       // Earlier sheets win outright so partially filled stock gets topped up first.
       for (let si = 0; si < sheets.length && !best; si++) {
-        const found = bestOnSheet(p, si)
+        const found = bestOnSheet(p, sheets[si], policy)
         if (found) best = { sheet: si, ...found }
       }
       if (!best) {
         let fitsEmpty = false
         for (const mir of mirrors) for (const rot of rotations) if (getMask(p, rot, mir)) fitsEmpty = true
         if (fitsEmpty) {
-          const si = sheets.length
-          newSheet()
-          const found = bestOnSheet(p, si)
+          sheets.push(newSheet())
+          const si = sheets.length - 1
+          const found = bestOnSheet(p, sheets[si], policy)
           if (found) best = { sheet: si, ...found }
         }
         if (!best) {
@@ -236,27 +320,28 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
         }
       }
 
-      const sheet = sheets[best.sheet]
-      const mask = best.mask
-      if (!mask.dilated) mask.dilated = dilate(mask.grid, gapPx)
-      // Occupancy coords are nest coords + PAD; the dilated stamp cancels the pad.
-      orInto(sheet.occ, mask.dilated, best.x, best.y)
-      sheet.topNest = Math.max(sheet.topNest, best.y + mask.h + gapPx)
-      sheet.usedWU = Math.max(sheet.usedWU, margin + best.x * res + mask.wU)
-      sheet.usedHU = Math.max(sheet.usedHU, margin + best.y * res + mask.hU)
-      sheet.placed++
-      placements.push({
-        partId: p.id,
-        sheet: best.sheet,
-        theta: mask.theta,
-        mirror: mask.mirror,
-        tx: margin + best.x * res - mask.offX,
-        ty: margin + best.y * res - mask.offY,
-      })
+      stamp(sheets[best.sheet], best.mask, best.x, best.y, policy)
+      items.push({ p, mask: best.mask, x: best.x, y: best.y, sheet: best.sheet })
       placedArea += p.area
       done++
       onProgress?.(done, total)
     }
+
+    // Derive per-sheet stats and placements from the final item list.
+    for (const it of items) {
+      const sheet = sheets[it.sheet]
+      sheet.usedWU = Math.max(sheet.usedWU, margin + it.x * res + it.mask.wU)
+      sheet.usedHU = Math.max(sheet.usedHU, margin + it.y * res + it.mask.hU)
+      sheet.placed++
+    }
+    const placements: Placement[] = items.map((it) => ({
+      partId: it.p.id,
+      sheet: it.sheet,
+      theta: it.mask.theta,
+      mirror: it.mask.mirror,
+      tx: margin + it.x * res - it.mask.offX,
+      ty: margin + it.y * res - it.mask.offY,
+    }))
 
     const sheetInfos: SheetInfo[] = sheets.map((s) => ({
       usedW: s.usedWU + margin,
@@ -278,9 +363,9 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
     return a.stockArea < b.stockArea - 1e-9
   }
 
-  let best = runPass(orders[0])
-  for (let i = 1; i < orders.length; i++) {
-    const pass = runPass(orders[i])
+  let best = runPass(passes[0].order, passes[0].policy)
+  for (let i = 1; i < passes.length; i++) {
+    const pass = runPass(passes[i].order, passes[i].policy)
     if (better(pass, best)) best = pass
   }
 
@@ -360,7 +445,7 @@ function buildMask(p: NestPart, theta: number, mirror: boolean, scale: number): 
   const h = Math.max(1, Math.ceil(hU * scale) + 1)
   if (w * h > 64_000_000) return null // pathological resolution/part combination
   const grid = rasterize(rings, opens, scale, w, h)
-  return { grid, w, h, offX: minX, offY: minY, wU, hU, theta, mirror, dilated: null }
+  return { grid, w, h, offX: minX, offY: minY, wU, hU, theta, mirror, dilated: null, dilatedC: null }
 }
 
 /**

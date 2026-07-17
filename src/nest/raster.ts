@@ -217,6 +217,49 @@ export function collide(occ: BitGrid, mask: BitGrid, ox: number, oy: number): bo
   return false
 }
 
+/**
+ * Count set bits of `mask` (placed at ox, oy) that coincide with set bits of `occ`.
+ * Same bounds requirements as collide().
+ */
+export function overlapCount(occ: BitGrid, mask: BitGrid, ox: number, oy: number): number {
+  const s = ox & 31
+  const wi = ox >> 5
+  const mw = mask.words
+  const ow = occ.words
+  const mdata = mask.data
+  const odata = occ.data
+  let n = 0
+  for (let my = 0; my < mask.h; my++) {
+    const mbase = my * mw
+    const obase = (oy + my) * ow + wi
+    let carry = 0
+    for (let i = 0; i < mw; i++) {
+      const m = mdata[mbase + i]
+      let v: number
+      if (s === 0) {
+        v = m & odata[obase + i]
+      } else {
+        v = ((m << s) | carry) & odata[obase + i]
+        carry = m >>> (32 - s)
+      }
+      if (v) {
+        v -= (v >>> 1) & 0x55555555
+        v = (v & 0x33333333) + ((v >>> 2) & 0x33333333)
+        n += (((v + (v >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24
+      }
+    }
+    if (carry) {
+      let v = carry & odata[obase + mw]
+      if (v) {
+        v -= (v >>> 1) & 0x55555555
+        v = (v & 0x33333333) + ((v >>> 2) & 0x33333333)
+        n += (((v + (v >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24
+      }
+    }
+  }
+  return n
+}
+
 /** OR `src` into `dst` at (ox, oy). Same bounds requirements as collide(). */
 export function orInto(dst: BitGrid, src: BitGrid, ox: number, oy: number): void {
   const s = ox & 31

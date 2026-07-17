@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { nest } from '../src/nest/nester'
 import type { NestPart, Placement } from '../src/nest/nester'
+import { BitGrid, overlapCount } from '../src/nest/raster'
 import type { Pt } from '../src/geom'
 
 function rectPart(id: number, w: number, h: number, count = 1): NestPart {
@@ -46,6 +47,23 @@ const baseOpts = {
   rotationStep: 90,
   mirror: false,
 }
+
+describe('overlapCount', () => {
+  it('counts coinciding bits across word boundaries', () => {
+    const occ = new BitGrid(96, 8)
+    for (let x = 28; x < 40; x++) for (let y = 2; y < 6; y++) occ.set(x, y)
+    const mask = new BitGrid(10, 4) // fully set 10x4 block
+    for (let x = 0; x < 10; x++) for (let y = 0; y < 4; y++) mask.set(x, y)
+    // Fully inside the occupied block.
+    expect(overlapCount(occ, mask, 29, 2)).toBe(40)
+    // Straddling the left edge of the block (and the 32-bit word boundary).
+    expect(overlapCount(occ, mask, 22, 2)).toBe(4 * 4)
+    // Rows partially outside the occupied band.
+    expect(overlapCount(occ, mask, 30, 4)).toBe(10 * 2)
+    // No overlap at all.
+    expect(overlapCount(occ, mask, 50, 2)).toBe(0)
+  })
+})
 
 describe('nest', () => {
   it('places all instances without overlap and respects spacing', () => {

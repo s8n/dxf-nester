@@ -62,10 +62,13 @@ Original layers are preserved.
 ## How the nesting works
 
 Parts are rasterized onto a bitset grid (with holes and pockets kept open, plus a
-conservative 1-pixel outline so thin features never vanish) and placed greedily
-bottom-left, trying every allowed orientation and keeping the lowest position. Spacing
-is enforced by morphologically dilating each placed part's footprint before stamping it
-into the occupancy grid — so clearances hold for concave shapes and holes too, not just
+conservative 1-pixel outline so thin features never vanish) and placed greedily from
+the bottom up. For each part every allowed orientation's lowest fit is found, and the
+winner is chosen by **touching perimeter**: the orientation whose placement touches
+the most already-placed material or sheet edge wins. That snugs parts into pockets,
+corners and interlocks instead of just stacking columns. Spacing is enforced by
+morphologically dilating each placed part's footprint before stamping it into the
+occupancy grid — so clearances hold for concave shapes and holes too, not just
 bounding boxes.
 
 Several placement orders are tried and the best result wins: plain biggest-first, plus
@@ -73,6 +76,8 @@ orders that promote "container" parts (more empty bbox space than material — C
 frames, brackets) so their pockets exist before the parts that could fill them are
 placed. Leading with only one or two containers is also tried, which keeps pockets
 available for big parts instead of letting containers interlock with each other first.
+A classic bottom-left pass runs as a safety net, and the best pass by parts placed,
+sheet count and stock consumed is kept.
 
 Accuracy is bounded by the **nesting resolution** (auto-chosen from sheet and part
 sizes, overridable under *Advanced*): placements are accurate to about one grid cell.
