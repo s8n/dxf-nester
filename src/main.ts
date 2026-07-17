@@ -51,6 +51,7 @@ const els = {
   mergeTol: $<HTMLInputElement>('opt-merge-tol'),
   nestBtn: $<HTMLButtonElement>('nest-btn'),
   cancelBtn: $<HTMLButtonElement>('cancel-btn'),
+  busy: $('nest-busy'),
   progress: $<HTMLProgressElement>('nest-progress'),
   resultSection: $('result-section'),
   stats: $('stats'),
@@ -325,6 +326,7 @@ function startNest(): void {
   state.worker = worker
   els.nestBtn.disabled = true
   els.cancelBtn.hidden = false
+  els.busy.hidden = false
   els.progress.hidden = false
   els.progress.value = 0
 
@@ -350,6 +352,7 @@ function stopWorker(): void {
   state.worker?.terminate()
   state.worker = null
   els.cancelBtn.hidden = true
+  els.busy.hidden = true
   els.progress.hidden = true
   els.nestBtn.disabled = state.parts.length === 0
 }
