@@ -41,6 +41,7 @@ const els = {
   mirror: $<HTMLInputElement>('opt-mirror'),
   sheetMode: $<HTMLSelectElement>('opt-sheet-mode'),
   sheetDims: $('sheet-dims'),
+  marginRow: $('margin-row'),
   sheetW: $<HTMLInputElement>('opt-sheet-w'),
   sheetH: $<HTMLInputElement>('opt-sheet-h'),
   margin: $<HTMLInputElement>('opt-margin'),
@@ -292,7 +293,8 @@ function nestOptions(): NestOptions {
   const mode = els.sheetMode.value
   return {
     gap: Math.max(0, num(els.gap, 0)),
-    margin: Math.max(0, num(els.margin, 0)),
+    // Auto mode sizes the sheet around the parts, so an edge margin is meaningless.
+    margin: mode === 'auto' ? 0 : Math.max(0, num(els.margin, 0)),
     resolution: els.resolution.value.trim() === '' ? null : Math.max(num(els.resolution, 0.5), 0.001),
     sheetWidth: mode === 'auto' ? null : Math.max(num(els.sheetW, 1000), 1),
     sheetHeight: mode === 'wh' ? Math.max(num(els.sheetH, 500), 1) : null,
@@ -463,6 +465,7 @@ for (const el of [els.grouping, els.joinTol, els.curveTol]) {
 els.sheetMode.addEventListener('change', () => {
   const mode = els.sheetMode.value
   els.sheetDims.style.display = mode === 'auto' ? 'none' : ''
+  els.marginRow.style.display = mode === 'auto' ? 'none' : ''
   ;(els.sheetH.parentElement!.parentElement as HTMLElement).style.visibility = mode === 'wh' ? 'visible' : 'hidden'
 })
 els.sheetMode.dispatchEvent(new Event('change'))

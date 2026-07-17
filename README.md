@@ -45,8 +45,9 @@ drawing units of your DXF.
   concavities of other parts when they fit (spacing respected). Works for open
   profiles too: a part may protrude through the opening of a C-channel while its body
   sits in the pocket.
-- **Sheet margin**, per-part **quantities**, live progress with cancel (nesting runs in
-  a Web Worker), pan/zoom preview, utilization stats.
+- **Sheet margin** (for fixed-size material — auto mode shrink-wraps the sheet around
+  the parts, so no margin applies), per-part **quantities**, live progress with cancel
+  (nesting runs in a Web Worker), pan/zoom preview, utilization stats.
 
 ## Supported DXF input
 
