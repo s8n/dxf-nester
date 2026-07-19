@@ -51,6 +51,7 @@ const els = {
   joinTol: $<HTMLInputElement>('opt-join-tol'),
   curveTol: $<HTMLInputElement>('opt-curve-tol'),
   mergeTol: $<HTMLInputElement>('opt-merge-tol'),
+  advanced: $<HTMLDetailsElement>('advanced'),
   nestBtn: $<HTMLButtonElement>('nest-btn'),
   cancelBtn: $<HTMLButtonElement>('cancel-btn'),
   busy: $('nest-busy'),
@@ -76,6 +77,66 @@ const buildOpts = () => ({
   joinTol: Math.max(num(els.joinTol, 0.01), 1e-9),
   curveTol: Math.max(num(els.curveTol, 0.05), 1e-4),
 })
+
+// ---------- settings persistence ----------
+
+// Chromium's duplicate-tab / session restore refills form controls without
+// firing events, skips hidden ones, and ignores <details> state, which used to
+// leave the sidebar half-restored and out of sync with the visible rows. The
+// controls opt out of browser restore via autocomplete="off"; instead every
+// setting is saved to localStorage and restored deterministically on startup
+// (after which the sheet-mode visibility sync below runs).
+const SETTINGS_KEY = 'dxf-nester:settings'
+
+const settingControls: Record<string, HTMLInputElement | HTMLSelectElement> = {
+  gap: els.gap,
+  merge: els.merge,
+  grouping: els.grouping,
+  rotation: els.rotation,
+  mirror: els.mirror,
+  sheetMode: els.sheetMode,
+  sheetW: els.sheetW,
+  sheetH: els.sheetH,
+  margin: els.margin,
+  resolution: els.resolution,
+  joinTol: els.joinTol,
+  curveTol: els.curveTol,
+  mergeTol: els.mergeTol,
+}
+
+function saveSettings(): void {
+  const data: Record<string, string | boolean> = { advancedOpen: els.advanced.open }
+  for (const [key, el] of Object.entries(settingControls)) {
+    data[key] = el instanceof HTMLInputElement && el.type === 'checkbox' ? el.checked : el.value
+  }
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(data))
+  } catch {
+    // Storage unavailable (private mode, quota): settings just don't persist.
+  }
+}
+
+function loadSettings(): void {
+  let data: unknown
+  try {
+    data = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? 'null')
+  } catch {
+    return
+  }
+  if (!data || typeof data !== 'object') return
+  const values = data as Record<string, unknown>
+  for (const [key, el] of Object.entries(settingControls)) {
+    const v = values[key]
+    if (el instanceof HTMLInputElement && el.type === 'checkbox') {
+      if (typeof v === 'boolean') el.checked = v
+    } else if (typeof v === 'string') {
+      // Ignore select values that no longer exist so they keep their default.
+      if (el instanceof HTMLSelectElement && ![...el.options].some((o) => o.value === v)) continue
+      el.value = v
+    }
+  }
+  if (typeof values.advancedOpen === 'boolean') els.advanced.open = values.advancedOpen
+}
 
 // ---------- messages ----------
 
@@ -568,6 +629,14 @@ els.sheetMode.addEventListener('change', () => {
   els.marginRow.style.display = mode === 'auto' ? 'none' : ''
   ;(els.sheetH.parentElement!.parentElement as HTMLElement).style.visibility = mode === 'wh' ? 'visible' : 'hidden'
 })
+
+for (const el of Object.values(settingControls)) {
+  el.addEventListener('change', saveSettings)
+  el.addEventListener('input', saveSettings)
+}
+els.advanced.addEventListener('toggle', saveSettings)
+
+loadSettings()
 els.sheetMode.dispatchEvent(new Event('change'))
 
 els.nestBtn.addEventListener('click', startNest)
