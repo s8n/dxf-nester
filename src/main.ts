@@ -52,6 +52,7 @@ const els = {
   curveTol: $<HTMLInputElement>('opt-curve-tol'),
   mergeTol: $<HTMLInputElement>('opt-merge-tol'),
   advanced: $<HTMLDetailsElement>('advanced'),
+  resetSettings: $<HTMLButtonElement>('reset-settings'),
   nestBtn: $<HTMLButtonElement>('nest-btn'),
   cancelBtn: $<HTMLButtonElement>('cancel-btn'),
   busy: $('nest-busy'),
@@ -114,6 +115,26 @@ function saveSettings(): void {
   } catch {
     // Storage unavailable (private mode, quota): settings just don't persist.
   }
+}
+
+function resetSettings(): void {
+  for (const el of Object.values(settingControls)) {
+    if (el instanceof HTMLSelectElement) {
+      for (const o of el.options) o.selected = o.defaultSelected
+    } else if (el.type === 'checkbox') {
+      el.checked = el.defaultChecked
+    } else {
+      el.value = el.defaultValue
+    }
+  }
+  els.advanced.open = false
+  els.sheetMode.dispatchEvent(new Event('change')) // resync dependent row visibility
+  try {
+    localStorage.removeItem(SETTINGS_KEY)
+  } catch {
+    // ignore
+  }
+  if (state.files.length) rebuildParts() // grouping/tolerances may have changed
 }
 
 function loadSettings(): void {
@@ -635,6 +656,7 @@ for (const el of Object.values(settingControls)) {
   el.addEventListener('input', saveSettings)
 }
 els.advanced.addEventListener('toggle', saveSettings)
+els.resetSettings.addEventListener('click', resetSettings)
 
 loadSettings()
 els.sheetMode.dispatchEvent(new Event('change'))
