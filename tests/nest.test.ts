@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { nest } from '../src/nest/nester'
+import {
+  betterPass,
+  createNestContext,
+  finalizeNest,
+  nest,
+  planBalanced,
+  planStage1,
+  runPassSpec,
+} from '../src/nest/nester'
 import type { NestPart, Placement } from '../src/nest/nester'
-import { BitGrid, overlapCount } from '../src/nest/raster'
+import { BitGrid, collide, overlapCount } from '../src/nest/raster'
 import type { Pt } from '../src/geom'
 
 function rectPart(id: number, w: number, h: number, count = 1): NestPart {
@@ -62,6 +70,48 @@ describe('overlapCount', () => {
     expect(overlapCount(occ, mask, 30, 4)).toBe(10 * 2)
     // No overlap at all.
     expect(overlapCount(occ, mask, 50, 2)).toBe(0)
+  })
+})
+
+describe('collide', () => {
+  function bruteCollides(occ: BitGrid, mask: BitGrid, ox: number, oy: number): boolean {
+    for (let y = 0; y < mask.h; y++) {
+      for (let x = 0; x < mask.w; x++) {
+        if (mask.get(x, y) && occ.get(ox + x, oy + y)) return true
+      }
+    }
+    return false
+  }
+
+  it('returns sound skip distances, never jumping past a free position', () => {
+    const occ = new BitGrid(160, 12)
+    occ.fillSpan(3, 40, 55)
+    occ.fillSpan(4, 90, 92)
+    occ.fillSpan(5, 10, 12)
+    occ.fillSpan(6, 120, 141)
+    occ.set(7, 63)
+    // Mask with holes: solid bottom row, then two prongs with a wide gap.
+    const mask = new BitGrid(34, 5)
+    mask.fillSpan(0, 0, 33)
+    for (let y = 1; y < 5; y++) {
+      mask.fillSpan(y, 0, 5)
+      mask.fillSpan(y, 28, 33)
+    }
+    for (let oy = 0; oy <= 7; oy++) {
+      for (let ox = 0; ox + mask.w <= occ.w; ) {
+        const d = collide(occ, mask, ox, oy)
+        expect(d === 0).toBe(!bruteCollides(occ, mask, ox, oy))
+        if (d === 0) {
+          ox++
+        } else {
+          // Every skipped position must also collide.
+          for (let k = 1; k < d && ox + k + mask.w <= occ.w; k++) {
+            expect(bruteCollides(occ, mask, ox + k, oy)).toBe(true)
+          }
+          ox += d
+        }
+      }
+    }
   })
 })
 
@@ -228,6 +278,26 @@ describe('nest', () => {
       expect(onSheet.filter((p) => p.partId === 1)).toHaveLength(1)
       expect(onSheet.filter((p) => p.partId === 2)).toHaveLength(2)
     }
+  })
+
+  it('staged pass API produces the same result as nest()', () => {
+    // The app runs passes on a worker pool via createNestContext/planStage1/
+    // planBalanced/runPassSpec; folding their results in spec order must be
+    // exactly equivalent to the sequential nest() driver.
+    const parts = [rectPart(1, 70, 70, 2), rectPart(2, 30, 30, 4), rectPart(3, 45, 20, 3)]
+    const opts = { ...baseOpts, gap: 0, resolution: 0.25, sheetWidth: 102, sheetHeight: 102 }
+    const direct = nest(parts, opts)
+
+    const ctx = createNestContext(parts, opts)!
+    expect(ctx).not.toBeNull()
+    const stage1 = planStage1(ctx).map((spec) => runPassSpec(ctx, spec))
+    let best = stage1[0]
+    for (const pass of stage1.slice(1)) if (betterPass(pass, best)) best = pass
+    for (const spec of planBalanced(ctx, best)) {
+      const pass = runPassSpec(ctx, spec)
+      if (betterPass(pass, best)) best = pass
+    }
+    expect(finalizeNest(ctx, best)).toEqual(direct)
   })
 
   it('reports parts too big for the workpiece', () => {

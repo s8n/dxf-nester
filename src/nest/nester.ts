@@ -98,8 +98,63 @@ function voidArea(p: NestPart): number {
  */
 type Policy = 'bl' | 'contact'
 
-export function nest(parts: NestPart[], opts: NestOptions, onProgress?: ProgressFn): NestResult {
+/** One greedy placement pass: an instance order (indices into ctx.instances),
+ * a position policy, and optionally a per-instance target sheet. Plain data so
+ * specs can be shipped to workers. */
+export interface PassSpec {
+  order: number[]
+  policy: Policy
+  /** Target sheet for each order entry (balanced distribution); fallback is any sheet. */
+  assign?: number[]
+}
+
+/** Serializable outcome of one pass — enough to compare passes and to build
+ * the final NestResult from the winner. */
+export interface PassResult {
+  placements: Placement[]
+  sheets: SheetInfo[]
+  placedArea: number
+  stockArea: number
+  /** Sum of per-sheet used bounding areas — lower = more compact nests, bigger offcuts. */
+  usedArea: number
+  failures: number[]
+}
+
+/**
+ * Everything a pass needs, derived deterministically from (parts, opts): sizing,
+ * resolution, the sorted instance list, candidate orders and the (lazy) mask
+ * cache. Workers build their own identical context once and then run any number
+ * of PassSpecs against it, so runPassSpec(ctx, spec) yields the same result on
+ * every thread and passes can be compared purely by spec order.
+ */
+export interface NestContext {
+  opts: NestOptions
+  rotations: number[]
+  mirrors: boolean[]
+  margin: number
+  sheetW: number
+  sheetH: number | null
+  innerWU: number
+  innerHU: number | null
+  res: number
+  scale: number
+  innerW: number
+  innerH: number | null
+  gapPx: number
+  pad: number
+  padC: number
+  totalArea: number
+  /** Placement instances (one entry per copy), biggest first. */
+  instances: NestPart[]
+  /** Candidate placement orders as indices into `instances`. */
+  orders: number[][]
+  maskCache: Map<string, Mask | null>
+}
+
+/** Build the shared per-nest context; null when there is nothing to place. */
+export function createNestContext(parts: NestPart[], opts: NestOptions): NestContext | null {
   const usable = parts.filter((p) => p.count > 0 && (p.rings.length > 0 || p.opens.length > 0))
+  if (usable.length === 0) return null
   const rotations: number[] = [0]
   if (opts.rotationStep > 0) {
     for (let a = opts.rotationStep; a < 360 - 1e-9; a += opts.rotationStep) rotations.push(a)
@@ -108,26 +163,17 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
 
   // Minimal bbox width each part can present, over all allowed orientations.
   let maxPartMinW = 0
-  let maxPartMinH = 0
   let minPartDim = Infinity
   let totalArea = 0
   for (const p of usable) {
     let best = Infinity
-    let bestH = Infinity
     for (const rot of rotations) {
-      const { w, h } = orientedBBox(p, (rot * Math.PI) / 180)
-      if (w < best) {
-        best = w
-        bestH = h
-      }
+      const { w } = orientedBBox(p, (rot * Math.PI) / 180)
+      if (w < best) best = w
     }
     maxPartMinW = Math.max(maxPartMinW, best)
-    maxPartMinH = Math.max(maxPartMinH, bestH)
     minPartDim = Math.min(minPartDim, Math.min(p.width, p.height))
     totalArea += p.area * p.count
-  }
-  if (usable.length === 0) {
-    return { placements: [], sheets: [], sheetW: 0, sheetH: null, resolution: 1, utilization: 0, failures: [] }
   }
 
   const margin = Math.max(0, opts.margin)
@@ -144,7 +190,10 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
   const innerW = Math.max(1, Math.round(innerWU * scale))
   const innerH = innerHU != null ? Math.max(1, Math.floor(innerHU * scale)) : null
   const gapPx = Math.max(0, Math.round(opts.gap * scale))
-  const PAD = gapPx
+  const pad = gapPx
+  // The contact grid uses one extra pad pixel so a mask's cells can coincide with
+  // zones dilated one px past the gap: overlap there = "touching across the gap".
+  const padC = pad + 1
 
   // Build instance list, biggest first.
   const instances: NestPart[] = []
@@ -159,64 +208,125 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
   // containers keeps their pockets available for the big parts that follow instead
   // of letting the containers interlock with each other first; each candidate
   // ordering runs a full greedy pass and the best result wins.
-  const orders: NestPart[][] = [instances]
+  const base = instances.map((_, i) => i)
+  const orders: number[][] = [base]
   const isContainer = (p: NestPart) => voidArea(p) >= p.area
   const containers = usable.filter(isContainer)
   const couldNest = containers.some(
     (c) => c.count > 1 || usable.some((p) => p !== c && p.area <= voidArea(c))
   )
   if (instances.length > 1 && couldNest) {
-    // instances is area-sorted, so these keep biggest-first within each class.
-    const contList = instances.filter(isContainer)
-    const nonList = instances.filter((p) => !isContainer(p))
-    const leads = [...new Set([contList.length, 1, 2])].filter((k) => k >= 1 && k <= contList.length)
+    // `base` is area-sorted, so these keep biggest-first within each class.
+    const contIdx = base.filter((i) => isContainer(instances[i]))
+    const nonIdx = base.filter((i) => !isContainer(instances[i]))
+    const leads = [...new Set([contIdx.length, 1, 2])].filter((k) => k >= 1 && k <= contIdx.length)
     for (const k of leads) {
-      const order = [...contList.slice(0, k), ...nonList, ...contList.slice(k)]
-      if (orders.every((o) => order.some((p, i) => p !== o[i]))) orders.push(order)
+      const order = [...contIdx.slice(0, k), ...nonIdx, ...contIdx.slice(k)]
+      const sameAs = (o: number[]) => order.every((idx, i) => instances[idx].id === instances[o[i]].id)
+      if (!orders.some(sameAs)) orders.push(order)
     }
   }
 
-  const maskCache = new Map<string, Mask | null>()
-  const getMask = (p: NestPart, rot: number, mir: boolean): Mask | null => {
-    const key = `${p.id}|${rot}|${mir}`
-    let m = maskCache.get(key)
-    if (m !== undefined) return m
-    m = buildMask(p, (rot * Math.PI) / 180, mir, scale)
-    if (m && (m.w > innerW || (innerH != null && m.h > innerH))) m = null
-    maskCache.set(key, m)
-    return m
+  return {
+    opts,
+    rotations,
+    mirrors,
+    margin,
+    sheetW,
+    sheetH,
+    innerWU,
+    innerHU,
+    res,
+    scale,
+    innerW,
+    innerH,
+    gapPx,
+    pad,
+    padC,
+    totalArea,
+    instances,
+    orders,
+    maskCache: new Map(),
   }
+}
 
-  interface Pass {
-    placements: Placement[]
-    sheets: SheetInfo[]
-    placedArea: number
-    stockArea: number
-    /** Sum of per-sheet used bounding areas — lower = more compact nests, bigger offcuts. */
-    usedArea: number
-    failures: Set<number>
-  }
+function getMask(ctx: NestContext, p: NestPart, rot: number, mir: boolean): Mask | null {
+  const key = `${p.id}|${rot}|${mir}`
+  let m = ctx.maskCache.get(key)
+  if (m !== undefined) return m
+  m = buildMask(p, (rot * Math.PI) / 180, mir, ctx.scale)
+  if (m && (m.w > ctx.innerW || (ctx.innerH != null && m.h > ctx.innerH))) m = null
+  ctx.maskCache.set(key, m)
+  return m
+}
 
-  // Contact-scored passes over every candidate order, plus one classic bottom-left
-  // pass on the plain order as a safety net for shapes where snug placement loses.
-  const passes: { order: NestPart[]; policy: Policy }[] = [
-    ...orders.map((order) => ({ order, policy: 'contact' as Policy })),
-    { order: instances, policy: 'bl' as Policy },
+/** Stage-1 passes: contact-scored passes over every candidate order, plus one
+ * classic bottom-left pass on the plain order as a safety net for shapes where
+ * snug placement loses. */
+export function planStage1(ctx: NestContext): PassSpec[] {
+  return [
+    ...ctx.orders.map((order) => ({ order, policy: 'contact' as Policy })),
+    { order: ctx.orders[0], policy: 'bl' as Policy },
   ]
-  let total = instances.length * passes.length
-  let done = 0
+}
 
-  interface PlacedItem {
-    p: NestPart
-    mask: Mask
-    x: number
-    y: number
-    sheet: number
+/**
+ * Stage-2 passes, planned from the stage-1 winner. Greedy top-up fills early
+ * sheets with whatever fits, which can strand an awkward remainder (e.g. all
+ * the bulky solids on sheet 1, all the sparse frames on sheet 2). When several
+ * fixed-size sheets are needed anyway, additionally try balanced distributions:
+ * pre-open a pool of sheets and spread the instances across them by area (each
+ * to the least-loaded sheet, in placement order), so complementary shapes can
+ * pair up on every sheet. Greedy can also overshoot the necessary sheet count
+ * outright — e.g. parts that only pack when grouped right, like half-frames
+ * enclosing their panels — so try pools smaller than the greedy result too,
+ * down to the area lower bound; a pass that fits everything on fewer sheets
+ * wins in betterPass().
+ */
+export function planBalanced(ctx: NestContext, best: PassResult): PassSpec[] {
+  const wantSheets = best.sheets.length
+  if (ctx.sheetH == null || wantSheets <= 1 || ctx.instances.length <= wantSheets || best.failures.length > 0) {
+    return []
   }
+  const areaBound = Math.ceil(ctx.totalArea / (ctx.innerWU * ctx.innerHU!) - 1e-9)
+  const lowK = Math.max(2, wantSheets - 2, Math.min(areaBound, wantSheets))
+  const specs: PassSpec[] = []
+  for (let pool = lowK; pool <= wantSheets; pool++) {
+    for (const order of ctx.orders) {
+      const load = new Array<number>(pool).fill(0)
+      const assign = order.map((idx) => {
+        let si = 0
+        for (let k = 1; k < pool; k++) if (load[k] < load[si]) si = k
+        load[si] += ctx.instances[idx].area
+        return si
+      })
+      specs.push({ order, policy: 'contact', assign })
+    }
+  }
+  return specs
+}
 
-  // The contact grid uses one extra pad pixel so a mask's cells can coincide with
-  // zones dilated one px past the gap: overlap there = "touching across the gap".
-  const PADC = PAD + 1
+/**
+ * Pass comparison: more parts placed > fewer sheets > less stock consumed >
+ * tighter per-sheet nests. The used-area tiebreak matters for fixed-size
+ * sheets, where every layout with the same sheet count consumes the same stock:
+ * preferring compact per-sheet bounding boxes keeps each sheet's leftover a
+ * large usable offcut. Ties keep `b`, so folding in spec order keeps the
+ * earlier pass regardless of which thread finished first.
+ */
+export function betterPass(a: PassResult, b: PassResult): boolean {
+  if (a.placements.length !== b.placements.length) return a.placements.length > b.placements.length
+  if (a.sheets.length !== b.sheets.length) return a.sheets.length < b.sheets.length
+  if (Math.abs(a.stockArea - b.stockArea) > 1e-9) return a.stockArea < b.stockArea
+  return a.usedArea < b.usedArea - 1e-9
+}
+
+/** Run one greedy placement pass. Pure w.r.t. (ctx's parts+opts, spec). */
+export function runPassSpec(ctx: NestContext, spec: PassSpec, onProgress?: ProgressFn): PassResult {
+  const { innerW, innerH, gapPx, pad: PAD, padC: PADC, margin, res, mirrors, rotations, sheetW, sheetH, opts } = ctx
+  const order = spec.order.map((i) => ctx.instances[i])
+  const policy = spec.policy
+  const assign = spec.assign
 
   const newSheet = (): Sheet => {
     const occC = new BitGrid(innerW + 2 * PADC, 128)
@@ -252,7 +362,7 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
     return overlapCount(sheet.occC, mask.grid, x + PADC, y + PADC)
   }
 
-  const stamp = (sheet: Sheet, mask: Mask, x: number, y: number, policy: Policy): void => {
+  const stamp = (sheet: Sheet, mask: Mask, x: number, y: number): void => {
     if (!mask.dilated) mask.dilated = dilate(mask.grid, gapPx)
     // Occupancy coords are nest coords + PAD; the dilated stamp cancels the pad.
     orInto(sheet.occ, mask.dilated, x, y)
@@ -269,12 +379,12 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
 
   // Best position for any allowed orientation of p on one sheet: the policy picks
   // among each orientation's lowest-left fit.
-  const bestOnSheet = (p: NestPart, sheet: Sheet, policy: Policy): { mask: Mask; x: number; y: number } | null => {
+  const bestOnSheet = (p: NestPart, sheet: Sheet): { mask: Mask; x: number; y: number } | null => {
     let sheetBest: { mask: Mask; x: number; y: number } | null = null
     let bestContact = -1
     for (const mir of mirrors) {
       for (const rot of rotations) {
-        const mask = getMask(p, rot, mir)
+        const mask = getMask(ctx, p, rot, mir)
         if (!mask) continue
         const pos = findFit(sheet, mask, innerW, innerH, PAD)
         if (!pos) continue
@@ -292,156 +402,144 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
     return sheetBest
   }
 
+  interface PlacedItem {
+    p: NestPart
+    mask: Mask
+    x: number
+    y: number
+    sheet: number
+  }
+
   // With `assign`, the pass distributes work across a fixed pool of sheets:
   // assign[i] is the sheet order[i] should land on (fallback: any sheet that
   // fits). Without it, earlier sheets win outright so partially filled stock
   // gets topped up first.
-  const runPass = (order: NestPart[], policy: Policy, assign?: number[]): Pass => {
-    const sheets: Sheet[] = []
-    if (assign) {
-      let pool = 0
-      for (const si of assign) pool = Math.max(pool, si + 1)
-      while (sheets.length < pool) sheets.push(newSheet())
-    }
-    const items: PlacedItem[] = []
-    const failures = new Set<number>()
-    let placedArea = 0
+  const sheets: Sheet[] = []
+  if (assign) {
+    let pool = 0
+    for (const si of assign) pool = Math.max(pool, si + 1)
+    while (sheets.length < pool) sheets.push(newSheet())
+  }
+  const items: PlacedItem[] = []
+  const failures = new Set<number>()
+  let placedArea = 0
+  let done = 0
 
-    for (let oi = 0; oi < order.length; oi++) {
-      const p = order[oi]
-      let best: { sheet: number; mask: Mask; x: number; y: number } | null = null
-      const target = assign?.[oi]
-      if (target != null && target < sheets.length) {
-        const found = bestOnSheet(p, sheets[target], policy)
-        if (found) best = { sheet: target, ...found }
-      }
-      for (let si = 0; si < sheets.length && !best; si++) {
-        if (si === target) continue
-        const found = bestOnSheet(p, sheets[si], policy)
+  for (let oi = 0; oi < order.length; oi++) {
+    const p = order[oi]
+    let best: { sheet: number; mask: Mask; x: number; y: number } | null = null
+    const target = assign?.[oi]
+    if (target != null && target < sheets.length) {
+      const found = bestOnSheet(p, sheets[target])
+      if (found) best = { sheet: target, ...found }
+    }
+    for (let si = 0; si < sheets.length && !best; si++) {
+      if (si === target) continue
+      const found = bestOnSheet(p, sheets[si])
+      if (found) best = { sheet: si, ...found }
+    }
+    if (!best) {
+      let fitsEmpty = false
+      for (const mir of mirrors) for (const rot of rotations) if (getMask(ctx, p, rot, mir)) fitsEmpty = true
+      if (fitsEmpty) {
+        sheets.push(newSheet())
+        const si = sheets.length - 1
+        const found = bestOnSheet(p, sheets[si])
         if (found) best = { sheet: si, ...found }
       }
       if (!best) {
-        let fitsEmpty = false
-        for (const mir of mirrors) for (const rot of rotations) if (getMask(p, rot, mir)) fitsEmpty = true
-        if (fitsEmpty) {
-          sheets.push(newSheet())
-          const si = sheets.length - 1
-          const found = bestOnSheet(p, sheets[si], policy)
-          if (found) best = { sheet: si, ...found }
-        }
-        if (!best) {
-          failures.add(p.id)
-          done++
-          onProgress?.(done, total)
-          continue
-        }
-      }
-
-      stamp(sheets[best.sheet], best.mask, best.x, best.y, policy)
-      items.push({ p, mask: best.mask, x: best.x, y: best.y, sheet: best.sheet })
-      placedArea += p.area
-      done++
-      onProgress?.(done, total)
-    }
-
-    // Derive per-sheet stats and placements from the final item list.
-    for (const it of items) {
-      const sheet = sheets[it.sheet]
-      sheet.usedWU = Math.max(sheet.usedWU, margin + it.x * res + it.mask.wU)
-      sheet.usedHU = Math.max(sheet.usedHU, margin + it.y * res + it.mask.hU)
-      sheet.placed++
-    }
-    // Drop sheets that ended up empty (possible with `assign`) and renumber.
-    const remap = new Map<number, number>()
-    const liveSheets = sheets.filter((s, i) => {
-      if (s.placed === 0) return false
-      remap.set(i, remap.size)
-      return true
-    })
-    const placements: Placement[] = items.map((it) => ({
-      partId: it.p.id,
-      sheet: remap.get(it.sheet)!,
-      theta: it.mask.theta,
-      mirror: it.mask.mirror,
-      tx: margin + it.x * res - it.mask.offX,
-      ty: margin + it.y * res - it.mask.offY,
-    }))
-
-    const sheetInfos: SheetInfo[] = liveSheets.map((s) => ({
-      usedW: s.usedWU + margin,
-      usedH: s.usedHU + margin,
-      placed: s.placed,
-    }))
-    let stockArea = 0
-    let usedArea = 0
-    for (const s of sheetInfos) {
-      stockArea += sheetH != null ? sheetW * sheetH : (opts.sheetWidth != null ? sheetW : s.usedW) * s.usedH
-      usedArea += s.usedW * s.usedH
-    }
-    return { placements, sheets: sheetInfos, placedArea, stockArea, usedArea, failures }
-  }
-
-  // More parts placed > fewer sheets > less stock consumed > tighter per-sheet
-  // nests. The used-area tiebreak matters for fixed-size sheets, where every
-  // layout with the same sheet count consumes the same stock: preferring compact
-  // per-sheet bounding boxes keeps each sheet's leftover a large usable offcut.
-  // Ties keep the earlier (plain biggest-first) pass.
-  const better = (a: Pass, b: Pass): boolean => {
-    if (a.placements.length !== b.placements.length) return a.placements.length > b.placements.length
-    if (a.sheets.length !== b.sheets.length) return a.sheets.length < b.sheets.length
-    if (Math.abs(a.stockArea - b.stockArea) > 1e-9) return a.stockArea < b.stockArea
-    return a.usedArea < b.usedArea - 1e-9
-  }
-
-  let best = runPass(passes[0].order, passes[0].policy)
-  for (let i = 1; i < passes.length; i++) {
-    const pass = runPass(passes[i].order, passes[i].policy)
-    if (better(pass, best)) best = pass
-  }
-
-  // Greedy top-up fills early sheets with whatever fits, which can strand an
-  // awkward remainder (e.g. all the bulky solids on sheet 1, all the sparse
-  // frames on sheet 2). When several fixed-size sheets are needed anyway,
-  // additionally try balanced distributions: pre-open a pool of sheets and
-  // spread the instances across them by area (each to the least-loaded sheet,
-  // in placement order), so complementary shapes can pair up on every sheet.
-  // Greedy can also overshoot the necessary sheet count outright — e.g. parts
-  // that only pack when grouped right, like half-frames enclosing their panels —
-  // so try pools smaller than the greedy result too, down to the area lower
-  // bound; a pass that fits everything on fewer sheets wins in better().
-  const wantSheets = best.sheets.length
-  if (sheetH != null && wantSheets > 1 && instances.length > wantSheets && best.failures.size === 0) {
-    const areaBound = Math.ceil(totalArea / (innerWU * innerHU!) - 1e-9)
-    const lowK = Math.max(2, wantSheets - 2, Math.min(areaBound, wantSheets))
-    const balanced: { order: NestPart[]; assign: number[] }[] = []
-    for (let pool = lowK; pool <= wantSheets; pool++) {
-      for (const order of orders) {
-        const load = new Array<number>(pool).fill(0)
-        const assign = order.map((p) => {
-          let si = 0
-          for (let k = 1; k < pool; k++) if (load[k] < load[si]) si = k
-          load[si] += p.area
-          return si
-        })
-        balanced.push({ order, assign })
+        failures.add(p.id)
+        done++
+        onProgress?.(done, order.length)
+        continue
       }
     }
-    total += instances.length * balanced.length
-    for (const { order, assign } of balanced) {
-      const pass = runPass(order, 'contact', assign)
-      if (better(pass, best)) best = pass
-    }
+
+    stamp(sheets[best.sheet], best.mask, best.x, best.y)
+    items.push({ p, mask: best.mask, x: best.x, y: best.y, sheet: best.sheet })
+    placedArea += p.area
+    done++
+    onProgress?.(done, order.length)
   }
 
+  // Derive per-sheet stats and placements from the final item list.
+  for (const it of items) {
+    const sheet = sheets[it.sheet]
+    sheet.usedWU = Math.max(sheet.usedWU, margin + it.x * res + it.mask.wU)
+    sheet.usedHU = Math.max(sheet.usedHU, margin + it.y * res + it.mask.hU)
+    sheet.placed++
+  }
+  // Drop sheets that ended up empty (possible with `assign`) and renumber.
+  const remap = new Map<number, number>()
+  const liveSheets = sheets.filter((s, i) => {
+    if (s.placed === 0) return false
+    remap.set(i, remap.size)
+    return true
+  })
+  const placements: Placement[] = items.map((it) => ({
+    partId: it.p.id,
+    sheet: remap.get(it.sheet)!,
+    theta: it.mask.theta,
+    mirror: it.mask.mirror,
+    tx: margin + it.x * res - it.mask.offX,
+    ty: margin + it.y * res - it.mask.offY,
+  }))
+
+  const sheetInfos: SheetInfo[] = liveSheets.map((s) => ({
+    usedW: s.usedWU + margin,
+    usedH: s.usedHU + margin,
+    placed: s.placed,
+  }))
+  let stockArea = 0
+  let usedArea = 0
+  for (const s of sheetInfos) {
+    stockArea += sheetH != null ? sheetW * sheetH : (opts.sheetWidth != null ? sheetW : s.usedW) * s.usedH
+    usedArea += s.usedW * s.usedH
+  }
+  return { placements, sheets: sheetInfos, placedArea, stockArea, usedArea, failures: [...failures] }
+}
+
+/** Build the final NestResult from the winning pass. */
+export function finalizeNest(ctx: NestContext, best: PassResult): NestResult {
   return {
     placements: best.placements,
     sheets: best.sheets,
-    sheetW,
-    sheetH: sheetH ?? null,
-    resolution: res,
+    sheetW: ctx.sheetW,
+    sheetH: ctx.sheetH ?? null,
+    resolution: ctx.res,
     utilization: best.stockArea > 0 ? best.placedArea / best.stockArea : 0,
-    failures: [...best.failures],
+    failures: best.failures,
   }
+}
+
+/** Sequential driver: plan, run every pass in order, keep the best, finalize.
+ * The app runs the same stages on a worker pool instead (see nest/worker.ts). */
+export function nest(parts: NestPart[], opts: NestOptions, onProgress?: ProgressFn): NestResult {
+  const ctx = createNestContext(parts, opts)
+  if (!ctx) {
+    return { placements: [], sheets: [], sheetW: 0, sheetH: null, resolution: 1, utilization: 0, failures: [] }
+  }
+  const n = ctx.instances.length
+  const stage1 = planStage1(ctx)
+  let total = n * stage1.length
+  let done = 0
+  const run = (spec: PassSpec): PassResult => {
+    const pass = runPassSpec(ctx, spec, (d) => onProgress?.(done + d, total))
+    done += n
+    return pass
+  }
+  let best = run(stage1[0])
+  for (let i = 1; i < stage1.length; i++) {
+    const pass = run(stage1[i])
+    if (betterPass(pass, best)) best = pass
+  }
+  const stage2 = planBalanced(ctx, best)
+  total += n * stage2.length
+  for (const spec of stage2) {
+    const pass = run(spec)
+    if (betterPass(pass, best)) best = pass
+  }
+  return finalizeNest(ctx, best)
 }
 
 function autoResolution(innerWU: number, minPartDim: number): number {
@@ -514,8 +612,9 @@ function buildMask(p: NestPart, theta: number, mirror: boolean, scale: number): 
 
 /**
  * Bottom-left first fit: scan upward with a coarse row stride, then refine the band.
- * Rows are scanned exhaustively in x (collide exits early on occupied spots), so
- * narrow slots — e.g. a snug pocket inside another part — are not skipped over.
+ * Rows are scanned exhaustively in x — collide()'s skip distances only jump over
+ * positions proven to collide — so narrow slots, e.g. a snug pocket inside
+ * another part, are never skipped over.
  * Returns nest-space pixel coords, or null if the mask cannot fit (height limit).
  */
 function findFit(sheet: Sheet, mask: Mask, innerW: number, innerH: number | null, PAD: number): { x: number; y: number } | null {
@@ -528,16 +627,20 @@ function findFit(sheet: Sheet, mask: Mask, innerW: number, innerH: number | null
   const occ = sheet.occ
   for (let y = 0; y <= scanTop; y += st) {
     occ.ensureRows(y + PAD + mask.h)
-    for (let x = 0; x <= maxX; x++) {
-      if (!collide(occ, mask.grid, x + PAD, y + PAD)) {
+    for (let x = 0; x <= maxX; ) {
+      const d = collide(occ, mask.grid, x + PAD, y + PAD)
+      if (d === 0) {
         // Found room in this band — refine to the lowest-left position inside it.
         for (let fy = Math.max(0, y - st + 1); fy < y; fy++) {
-          for (let fx = 0; fx <= maxX; fx++) {
-            if (!collide(occ, mask.grid, fx + PAD, fy + PAD)) return { x: fx, y: fy }
+          for (let fx = 0; fx <= maxX; ) {
+            const fd = collide(occ, mask.grid, fx + PAD, fy + PAD)
+            if (fd === 0) return { x: fx, y: fy }
+            fx += fd
           }
         }
         return { x, y }
       }
+      x += d
     }
   }
   // Nothing inside the used region — place on top if the height limit allows.

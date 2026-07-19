@@ -190,8 +190,16 @@ export function dilate(src: BitGrid, g: number): BitGrid {
 /**
  * Test whether `mask` placed with its origin at (ox, oy) overlaps set bits of `occ`.
  * Requires 0 <= ox, ox + mask.w <= occ.w, and occ.h >= oy + mask.h.
+ *
+ * Returns 0 when the placement is free. On collision returns a skip distance
+ * d >= 1 with the guarantee that placements at ox+1 .. ox+d-1 all collide too,
+ * so a left-to-right scan may advance x by d without missing any free position
+ * (including positions inside pockets and holes — the guarantee is exact, not
+ * heuristic). The distance comes from the rightmost conflicting occupied cell c
+ * of the first conflicting mask row: sliding right, that row keeps a set bit on
+ * c until its next hole below the hit reaches it.
  */
-export function collide(occ: BitGrid, mask: BitGrid, ox: number, oy: number): boolean {
+export function collide(occ: BitGrid, mask: BitGrid, ox: number, oy: number): number {
   const s = ox & 31
   const wi = ox >> 5
   const mw = mask.words
@@ -202,19 +210,53 @@ export function collide(occ: BitGrid, mask: BitGrid, ox: number, oy: number): bo
     const mbase = my * mw
     const obase = (oy + my) * ow + wi
     let carry = 0
+    let confAt = -1
+    let confBits = 0
     for (let i = 0; i < mw; i++) {
       const m = mdata[mbase + i]
+      let bits: number
       if (s === 0) {
-        if (m & odata[obase + i]) return true
+        bits = m
       } else {
-        const bits = (m << s) | carry
-        if (bits & odata[obase + i]) return true
+        bits = (m << s) | carry
         carry = m >>> (32 - s)
       }
+      const conf = bits & odata[obase + i]
+      if (conf) {
+        confAt = i
+        confBits = conf
+      }
     }
-    if (carry && carry & odata[obase + mw]) return true
+    if (carry) {
+      const conf = carry & odata[obase + mw]
+      if (conf) {
+        confAt = mw
+        confBits = conf
+      }
+    }
+    if (confAt < 0) continue
+    // Rightmost conflicting occupancy column (absolute) and the mask column on it.
+    const c = ((wi + confAt) << 5) + 31 - Math.clz32(confBits >>> 0)
+    const mcol = c - ox
+    // Find the highest clear mask bit m0 below mcol in this row: every position
+    // ox' in (ox, c - m0) still has a set mask bit landing on cell c.
+    let m0 = -1
+    if (mcol > 0) {
+      let w2 = (mcol - 1) >> 5
+      const top = (mcol - 1) & 31
+      let inv = ~mdata[mbase + w2] & (top === 31 ? -1 : (1 << (top + 1)) - 1)
+      for (;;) {
+        if (inv) {
+          m0 = (w2 << 5) + 31 - Math.clz32(inv >>> 0)
+          break
+        }
+        if (--w2 < 0) break
+        inv = ~mdata[mbase + w2]
+      }
+    }
+    return c - m0 - ox
   }
-  return false
+  return 0
 }
 
 /**

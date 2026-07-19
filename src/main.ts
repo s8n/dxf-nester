@@ -6,10 +6,12 @@ import { writeDxf } from './dxf/write'
 import type { PlacedGroup } from './dxf/write'
 import { buildParts, resetPartIds } from './parts'
 import type { GroupingMode, Part } from './parts'
-import type { NestOptions, NestPart, NestResult } from './nest/nester'
+import { betterPass, createNestContext, finalizeNest, planBalanced, planStage1 } from './nest/nester'
+import type { NestContext, NestOptions, NestPart, NestResult, PassResult, PassSpec } from './nest/nester'
 import { CanvasView, drawPartShape, layoutSheets, partColor } from './render'
 import { demoEntities } from './demo'
 import NestWorker from './nest/worker?worker'
+import type { WorkerRequest, WorkerResponse } from './nest/worker'
 
 interface LoadedFile {
   name: string
@@ -21,7 +23,7 @@ const state = {
   parts: [] as Part[],
   result: null as NestResult | null,
   tab: 'parts' as 'parts' | 'nested',
-  worker: null as Worker | null,
+  pool: null as Worker[] | null,
 }
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
@@ -135,7 +137,7 @@ function rebuildParts(): void {
 function syncUi(): void {
   const has = state.parts.length > 0
   els.partsSection.hidden = !has
-  els.nestBtn.disabled = !has || state.worker != null
+  els.nestBtn.disabled = !has || state.pool != null
   els.partCount.textContent = String(state.parts.length)
   els.resultSection.hidden = state.result == null
   els.tabNested.disabled = state.result == null
@@ -305,7 +307,7 @@ function nestOptions(): NestOptions {
 }
 
 function startNest(): void {
-  if (state.worker || state.parts.length === 0) return
+  if (state.pool || state.parts.length === 0) return
   clearMessages()
   const nestParts: NestPart[] = state.parts
     .filter((p) => p.count > 0)
@@ -322,35 +324,105 @@ function startNest(): void {
     message('All part quantities are 0 — nothing to nest.', 'warn')
     return
   }
-  const worker = new NestWorker()
-  state.worker = worker
+  const opts = nestOptions()
+  // Planning is cheap (masks rasterize lazily inside workers); the main-thread
+  // context only sizes the sheet, orders instances and finalizes the winner.
+  const ctx = createNestContext(nestParts, opts)
+  if (!ctx) {
+    message('Nothing to nest — no usable geometry in the selected parts.', 'warn')
+    return
+  }
+  const stage1 = planStage1(ctx)
+  const poolSize = Math.max(1, Math.min((navigator.hardwareConcurrency || 4) - 1, 8, stage1.length))
+  const pool: Worker[] = []
+  for (let i = 0; i < poolSize; i++) {
+    const w = new NestWorker()
+    w.postMessage({ kind: 'init', parts: nestParts, opts } satisfies WorkerRequest)
+    pool.push(w)
+  }
+  state.pool = pool
   els.nestBtn.disabled = true
   els.cancelBtn.hidden = false
   els.busy.hidden = false
   els.progress.hidden = false
   els.progress.value = 0
-
-  worker.onmessage = (ev: MessageEvent) => {
-    const msg = ev.data
-    if (msg.type === 'progress') {
-      els.progress.value = msg.total ? msg.done / msg.total : 0
-    } else if (msg.type === 'done') {
-      finishNest(msg.result as NestResult)
-    } else if (msg.type === 'error') {
-      message(`Nesting failed: ${msg.message}`, 'error')
-      stopWorker()
-    }
-  }
-  worker.onerror = (e) => {
-    message(`Nesting failed: ${e.message}`, 'error')
-    stopWorker()
-  }
-  worker.postMessage({ parts: nestParts, opts: nestOptions() })
+  void orchestrateNest(ctx, stage1, pool)
 }
 
-function stopWorker(): void {
-  state.worker?.terminate()
-  state.worker = null
+/**
+ * Fan the passes out over the worker pool: run stage 1, fold the winner in
+ * spec order (deterministic — identical to the sequential nest() driver), plan
+ * the balanced stage-2 passes from it, run those, finalize.
+ */
+async function orchestrateNest(ctx: NestContext, stage1: PassSpec[], pool: Worker[]): Promise<void> {
+  const fractions: number[] = []
+  let totalPasses = stage1.length
+  const showProgress = () => {
+    els.progress.value = fractions.reduce((s, f) => s + (f || 0), 0) / totalPasses
+  }
+  try {
+    const r1 = await runSpecsOnPool(pool, stage1, 0, fractions, showProgress)
+    if (state.pool !== pool) return // cancelled
+    let best = r1[0]
+    for (const pass of r1.slice(1)) if (betterPass(pass, best)) best = pass
+    const stage2 = planBalanced(ctx, best)
+    if (stage2.length > 0) {
+      totalPasses += stage2.length
+      const r2 = await runSpecsOnPool(pool, stage2, stage1.length, fractions, showProgress)
+      if (state.pool !== pool) return
+      for (const pass of r2) if (betterPass(pass, best)) best = pass
+    }
+    finishNest(finalizeNest(ctx, best))
+  } catch (err) {
+    if (state.pool !== pool) return
+    message(`Nesting failed: ${err instanceof Error ? err.message : String(err)}`, 'error')
+    stopPool()
+  }
+}
+
+/** Dispatch specs across the pool, feeding each worker a new spec as it finishes. */
+function runSpecsOnPool(
+  pool: Worker[],
+  specs: PassSpec[],
+  seqBase: number,
+  fractions: number[],
+  onProgress: () => void
+): Promise<PassResult[]> {
+  return new Promise((resolve, reject) => {
+    const results = new Array<PassResult>(specs.length)
+    let nextIdx = 0
+    let doneCount = 0
+    const feed = (w: Worker): void => {
+      if (nextIdx >= specs.length) return
+      const idx = nextIdx++
+      w.postMessage({ kind: 'pass', seq: seqBase + idx, spec: specs[idx] } satisfies WorkerRequest)
+    }
+    for (const w of pool) {
+      w.onmessage = (ev: MessageEvent<WorkerResponse>) => {
+        const msg = ev.data
+        if (msg.type === 'pass-progress') {
+          fractions[msg.seq] = msg.total ? msg.done / msg.total : 0
+          onProgress()
+        } else if (msg.type === 'pass-done') {
+          fractions[msg.seq] = 1
+          onProgress()
+          results[msg.seq - seqBase] = msg.pass
+          doneCount++
+          if (doneCount === specs.length) resolve(results)
+          else feed(w)
+        } else if (msg.type === 'error') {
+          reject(new Error(msg.message))
+        }
+      }
+      w.onerror = (e) => reject(new Error(e.message || 'worker crashed'))
+      feed(w)
+    }
+  })
+}
+
+function stopPool(): void {
+  if (state.pool) for (const w of state.pool) w.terminate()
+  state.pool = null
   els.cancelBtn.hidden = true
   els.busy.hidden = true
   els.progress.hidden = true
@@ -358,7 +430,7 @@ function stopWorker(): void {
 }
 
 function finishNest(result: NestResult): void {
-  stopWorker()
+  stopPool()
   state.result = result
   syncUi()
   showStats(result)
@@ -475,7 +547,7 @@ els.sheetMode.dispatchEvent(new Event('change'))
 
 els.nestBtn.addEventListener('click', startNest)
 els.cancelBtn.addEventListener('click', () => {
-  stopWorker()
+  stopPool()
   message('Nesting cancelled.', 'warn')
 })
 els.downloadBtn.addEventListener('click', download)
