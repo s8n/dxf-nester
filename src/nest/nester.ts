@@ -402,21 +402,30 @@ export function nest(parts: NestPart[], opts: NestOptions, onProgress?: Progress
   // Greedy top-up fills early sheets with whatever fits, which can strand an
   // awkward remainder (e.g. all the bulky solids on sheet 1, all the sparse
   // frames on sheet 2). When several fixed-size sheets are needed anyway,
-  // additionally try balanced distributions: pre-open that many sheets and
+  // additionally try balanced distributions: pre-open a pool of sheets and
   // spread the instances across them by area (each to the least-loaded sheet,
   // in placement order), so complementary shapes can pair up on every sheet.
+  // Greedy can also overshoot the necessary sheet count outright — e.g. parts
+  // that only pack when grouped right, like half-frames enclosing their panels —
+  // so try pools smaller than the greedy result too, down to the area lower
+  // bound; a pass that fits everything on fewer sheets wins in better().
   const wantSheets = best.sheets.length
   if (sheetH != null && wantSheets > 1 && instances.length > wantSheets && best.failures.size === 0) {
-    const balanced = orders.map((order) => {
-      const load = new Array<number>(wantSheets).fill(0)
-      const assign = order.map((p) => {
-        let si = 0
-        for (let k = 1; k < wantSheets; k++) if (load[k] < load[si]) si = k
-        load[si] += p.area
-        return si
-      })
-      return { order, assign }
-    })
+    const areaBound = Math.ceil(totalArea / (innerWU * innerHU!) - 1e-9)
+    const lowK = Math.max(2, wantSheets - 2, Math.min(areaBound, wantSheets))
+    const balanced: { order: NestPart[]; assign: number[] }[] = []
+    for (let pool = lowK; pool <= wantSheets; pool++) {
+      for (const order of orders) {
+        const load = new Array<number>(pool).fill(0)
+        const assign = order.map((p) => {
+          let si = 0
+          for (let k = 1; k < pool; k++) if (load[k] < load[si]) si = k
+          load[si] += p.area
+          return si
+        })
+        balanced.push({ order, assign })
+      }
+    }
     total += instances.length * balanced.length
     for (const { order, assign } of balanced) {
       const pass = runPass(order, 'contact', assign)
