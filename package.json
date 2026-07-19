@@ -6,11 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:wasm": "cargo build --release --target wasm32-unknown-unknown --manifest-path nest-core/Cargo.toml && wasm-bindgen --target web --out-dir nest-core/pkg --out-name nest_core nest-core/target/wasm32-unknown-unknown/release/nest_core.wasm",
     "preview": "vite preview",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@types/node": "^26.1.1",
     "typescript": "^5.5.4",
     "vite": "^5.4.8",
     "vitest": "^2.1.1"

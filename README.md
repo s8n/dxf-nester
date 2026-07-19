@@ -88,6 +88,29 @@ sizes, overridable under *Advanced*): placements are accurate to about one grid 
 Finer resolution nests tighter but takes longer. This is a heuristic packer — it aims
 for a very good nest quickly, not a provably optimal one.
 
+## The Rust core
+
+The placement engine lives in [`nest-core/`](nest-core/), a dependency-light Rust
+crate compiled to WebAssembly and run inside the app's worker pool (candidate
+placement passes are planned in TypeScript and fanned out across workers; each
+worker runs them through the WASM engine). The crate is a bit-exact port of the
+TypeScript engine in `src/nest/` — `tests/wasm.test.ts` asserts both produce
+identical results, and the TS engine remains as an automatic fallback when WASM
+is unavailable. The result panel shows which engine ran.
+
+Rebuilding the WASM module after changing the crate needs the `wasm32-unknown-unknown`
+target and `wasm-bindgen-cli` (matching the `wasm-bindgen` version in `Cargo.lock`):
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli
+npm run build:wasm
+```
+
+The generated `nest-core/pkg/` is committed, so the web app builds without a Rust
+toolchain. `nest-core` is also usable as a plain Rust library (`cargo test` runs
+its native tests) if you want nesting outside the browser.
+
 ## Limitations
 
 - 2D only; Z coordinates and 3D polylines are ignored/skipped.

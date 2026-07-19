@@ -24,6 +24,7 @@ const state = {
   result: null as NestResult | null,
   tab: 'parts' as 'parts' | 'nested',
   pool: null as Worker[] | null,
+  engine: null as 'wasm' | 'ts' | null,
 }
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
@@ -419,6 +420,9 @@ function startNest(): void {
   const pool: Worker[] = []
   for (let i = 0; i < poolSize; i++) {
     const w = new NestWorker()
+    w.onmessage = (ev: MessageEvent<WorkerResponse>) => {
+      if (ev.data.type === 'ready') state.engine = ev.data.engine
+    }
     w.postMessage({ kind: 'init', parts: nestParts, opts } satisfies WorkerRequest)
     pool.push(w)
   }
@@ -482,7 +486,9 @@ function runSpecsOnPool(
     for (const w of pool) {
       w.onmessage = (ev: MessageEvent<WorkerResponse>) => {
         const msg = ev.data
-        if (msg.type === 'pass-progress') {
+        if (msg.type === 'ready') {
+          state.engine = msg.engine
+        } else if (msg.type === 'pass-progress') {
           fractions[msg.seq] = msg.total ? msg.done / msg.total : 0
           onProgress()
         } else if (msg.type === 'pass-done') {
@@ -539,6 +545,7 @@ function showStats(r: NestResult, elapsedMs: number): void {
   rows.push(['Material used', `${(r.utilization * 100).toFixed(1)} %`])
   rows.push(['Resolution', `${r.resolution.toFixed(3)} u/px`])
   rows.push(['Nest time', elapsedMs < 9500 ? `${(elapsedMs / 1000).toFixed(2)} s` : `${(elapsedMs / 1000).toFixed(1)} s`])
+  if (state.engine) rows.push(['Engine', state.engine === 'wasm' ? 'Rust / WASM' : 'TypeScript'])
   els.stats.innerHTML = ''
   for (const [k, v] of rows) {
     const key = document.createElement('span')
