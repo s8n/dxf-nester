@@ -11,7 +11,7 @@
       <aside id="sidebar">
         <header>
           <h1>DXF Nester</h1>
-          <p class="sub">Nest DXF parts onto the smallest sheet — in your browser.</p>
+          <p class="sub">Nest DXF parts onto the smallest sheet, right in your browser.</p>
         </header>
 
         <div id="drop" class="drop" tabindex="0">
@@ -38,14 +38,14 @@
 
           <label class="row checkbox" id="merge-row">
             <input id="opt-merge" type="checkbox" />
-            <span>Merge coincident cut lines on export <em class="hint">for spacing 0 — deduplicates shared edges</em></span>
+            <span>Merge coincident cut lines on export <em class="hint">for spacing 0: deduplicates shared edges</em></span>
           </label>
 
           <label class="row">
             <span>Part grouping</span>
             <select id="opt-grouping">
-              <option value="auto" selected>Auto — closed loops, contained loops become holes</option>
-              <option value="layer">By layer — one rigid part per layer</option>
+              <option value="auto" selected>Auto: closed loops, contained loops become holes</option>
+              <option value="layer">By layer: one rigid part per layer</option>
               <option value="loop">Each closed loop separately (no holes)</option>
               <option value="entity">Each entity separately</option>
             </select>
@@ -70,7 +70,7 @@
           <label class="row">
             <span>Sheet / workpiece</span>
             <select id="opt-sheet-mode">
-              <option value="auto" selected>Auto — smallest bounding area</option>
+              <option value="auto" selected>Auto: smallest bounding area</option>
               <option value="width">Fixed width, unlimited length</option>
               <option value="wh">Fixed size (multiple sheets if needed)</option>
             </select>
@@ -123,7 +123,8 @@
         <div id="messages"></div>
 
         <footer>
-          <p>Everything runs locally — files never leave your browser. <br />u = drawing units of your DXF.</p>
+          <p>Everything runs locally; files never leave your browser. <br />u = drawing units of your DXF.</p>
+          <p><a href="https://github.com/s8n/dxf-nester" target="_blank" rel="noopener">Source code</a></p>
         </footer>
       </aside>
 

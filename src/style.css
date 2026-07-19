@@ -384,6 +384,15 @@ footer p {
   margin: 0;
 }
 
+footer a {
+  color: var(--muted);
+  text-decoration: underline;
+}
+
+footer a:hover {
+  color: var(--text);
+}
+
 #viewport {
   flex: 1;
   position: relative;

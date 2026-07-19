@@ -321,7 +321,7 @@ function startNest(): void {
       count: p.count,
     }))
   if (nestParts.length === 0) {
-    message('All part quantities are 0 — nothing to nest.', 'warn')
+    message('All part quantities are 0, nothing to nest.', 'warn')
     return
   }
   const opts = nestOptions()
@@ -329,7 +329,7 @@ function startNest(): void {
   // context only sizes the sheet, orders instances and finalizes the winner.
   const ctx = createNestContext(nestParts, opts)
   if (!ctx) {
-    message('Nothing to nest — no usable geometry in the selected parts.', 'warn')
+    message('Nothing to nest: no usable geometry in the selected parts.', 'warn')
     return
   }
   const stage1 = planStage1(ctx)
@@ -346,7 +346,7 @@ function startNest(): void {
   els.busy.hidden = false
   els.progress.hidden = false
   els.progress.value = 0
-  void orchestrateNest(ctx, stage1, pool)
+  void orchestrateNest(ctx, stage1, pool, performance.now())
 }
 
 /**
@@ -354,7 +354,7 @@ function startNest(): void {
  * spec order (deterministic — identical to the sequential nest() driver), plan
  * the balanced stage-2 passes from it, run those, finalize.
  */
-async function orchestrateNest(ctx: NestContext, stage1: PassSpec[], pool: Worker[]): Promise<void> {
+async function orchestrateNest(ctx: NestContext, stage1: PassSpec[], pool: Worker[], t0: number): Promise<void> {
   const fractions: number[] = []
   let totalPasses = stage1.length
   const showProgress = () => {
@@ -372,7 +372,7 @@ async function orchestrateNest(ctx: NestContext, stage1: PassSpec[], pool: Worke
       if (state.pool !== pool) return
       for (const pass of r2) if (betterPass(pass, best)) best = pass
     }
-    finishNest(finalizeNest(ctx, best))
+    finishNest(finalizeNest(ctx, best), performance.now() - t0)
   } catch (err) {
     if (state.pool !== pool) return
     message(`Nesting failed: ${err instanceof Error ? err.message : String(err)}`, 'error')
@@ -429,22 +429,22 @@ function stopPool(): void {
   els.nestBtn.disabled = state.parts.length === 0
 }
 
-function finishNest(result: NestResult): void {
+function finishNest(result: NestResult, elapsedMs: number): void {
   stopPool()
   state.result = result
   syncUi()
-  showStats(result)
+  showStats(result, elapsedMs)
   if (result.failures.length) {
     const names = result.failures
       .map((id) => state.parts.find((p) => p.id === id)?.name ?? `#${id}`)
       .slice(0, 4)
-    message(`Could not fit: ${names.join(', ')}${result.failures.length > 4 ? '…' : ''} — increase the sheet size or allow rotation.`, 'error')
+    message(`Could not fit: ${names.join(', ')}${result.failures.length > 4 ? '…' : ''}. Increase the sheet size or allow rotation.`, 'error')
   }
   setTab('nested')
   fitNestedView()
 }
 
-function showStats(r: NestResult): void {
+function showStats(r: NestResult, elapsedMs: number): void {
   const rows: [string, string][] = []
   const placed = r.placements.length
   const total = state.parts.reduce((s, p) => s + p.count, 0)
@@ -456,6 +456,7 @@ function showStats(r: NestResult): void {
   }
   rows.push(['Material used', `${(r.utilization * 100).toFixed(1)} %`])
   rows.push(['Resolution', `${r.resolution.toFixed(3)} u/px`])
+  rows.push(['Nest time', elapsedMs < 9500 ? `${(elapsedMs / 1000).toFixed(2)} s` : `${(elapsedMs / 1000).toFixed(1)} s`])
   els.stats.innerHTML = ''
   for (const [k, v] of rows) {
     const key = document.createElement('span')
