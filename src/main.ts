@@ -469,21 +469,45 @@ function showStats(r: NestResult, elapsedMs: number): void {
 
 // ---------- export ----------
 
+/** DXF-safe (R12) layer name: letters, digits, $, -, _; unique within `used`. */
+function layerName(name: string, used: Set<string>): string {
+  const base = name.replace(/[^A-Za-z0-9$_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 28) || 'part'
+  let out = base
+  for (let n = 2; used.has(out); n++) out = `${base.slice(0, 28 - String(n).length)}_${n}`
+  used.add(out)
+  return out
+}
+
 function download(): void {
   const result = state.result
   if (!result) return
   const layout = layoutSheets(result)
   const partById = new Map(state.parts.map((p) => [p.id, p]))
   const groups: PlacedGroup[] = []
+  // Remake layers so every detected part gets exactly one layer of its own,
+  // letting importers (e.g. LightBurn) select and configure per part. The one
+  // exception is "by layer" grouping, where parts already are the original
+  // layers, so those are kept untouched.
+  const remakeLayers = els.grouping.value !== 'layer'
+  const usedNames = new Set<string>()
+  const layerMaps = new Map<number, Record<string, string>>()
   for (const pl of result.placements) {
     const part = partById.get(pl.partId)
     if (!part) continue
+    let layerMap = layerMaps.get(part.id)
+    if (!layerMap && remakeLayers) {
+      const partLayer = layerName(part.name, usedNames)
+      layerMap = {}
+      for (const e of part.entities) layerMap[e.layer] = partLayer
+      layerMaps.set(part.id, layerMap)
+    }
     groups.push({
       entities: part.entities,
       origin: part.origin,
       theta: pl.theta,
       mirror: pl.mirror,
       t: { x: pl.tx + (layout.offsets[pl.sheet] ?? 0), y: pl.ty },
+      layerMap,
     })
   }
   const dxf = writeDxf(groups, {

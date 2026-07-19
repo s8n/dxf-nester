@@ -104,6 +104,40 @@ describe('dxf parser', () => {
     expect(back.filter((e) => e.type === 'LINE')).toHaveLength(2)
   })
 
+  it('remakes layers per group and declares them in a layer table', () => {
+    // Two "parts" sharing source layer 0 (one also engraves on a second layer);
+    // each group flattens onto its own part layer.
+    const partA: Entity[] = [{ type: 'LINE', layer: '0', a: { x: 0, y: 0 }, b: { x: 5, y: 0 } }]
+    const partB: Entity[] = [
+      { type: 'LINE', layer: '0', a: { x: 0, y: 0 }, b: { x: 3, y: 3 } },
+      { type: 'CIRCLE', layer: 'engrave', center: { x: 1, y: 1 }, r: 1 },
+    ]
+    const text = writeDxf(
+      [
+        { entities: partA, origin: { x: 0, y: 0 }, theta: 0, mirror: false, t: { x: 0, y: 0 }, layerMap: { '0': 'panel_1' } },
+        {
+          entities: partB,
+          origin: { x: 0, y: 0 },
+          theta: 0,
+          mirror: false,
+          t: { x: 10, y: 0 },
+          layerMap: { '0': 'frame_1', engrave: 'frame_1' },
+        },
+      ],
+      { mergeLines: false, mergeTol: 0.01, curveTol: 0.05 },
+    )
+    const { entities: back } = parseDxf(text)
+    expect(back.map((e) => e.layer).sort()).toEqual(['frame_1', 'frame_1', 'panel_1'])
+    // The TABLES section declares each used layer with a color.
+    const lines = text.split('\n')
+    const tableStart = lines.indexOf('TABLES')
+    expect(tableStart).toBeGreaterThan(-1)
+    const table = lines.slice(tableStart, lines.indexOf('ENTITIES'))
+    for (const name of ['panel_1', 'frame_1']) expect(table).toContain(name)
+    // Colors assigned per layer.
+    expect(table.filter((l) => l === '62')).toHaveLength(2)
+  })
+
   it('applies placement transforms on export', () => {
     const entities: Entity[] = [{ type: 'LINE', layer: 'a', a: { x: 10, y: 10 }, b: { x: 20, y: 10 } }]
     const text = writeDxf(

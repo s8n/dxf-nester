@@ -58,7 +58,10 @@ handled. Text, dimensions and hatches are ignored with a warning.
 
 The export is written as R12-style DXF (`LINE`, `ARC`, `CIRCLE`, `POLYLINE` with
 bulges) for maximum compatibility; ellipses and splines are exported as fine polylines.
-Original layers are preserved.
+Layers are remade on export: every detected part gets its own layer, named after the
+part, so importers like LightBurn can select and configure each part directly. With
+*By layer* grouping the original layers are kept instead. All layers are declared in
+a layer table with distinct colors.
 
 ## How the nesting works
 
