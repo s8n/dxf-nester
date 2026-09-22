@@ -108,6 +108,31 @@ describe('wasm engine equivalence', () => {
     })
   })
 
+  it('matches the TS engine on a tight hole under a height limit, many copies', () => {
+    const frame: NestPart = {
+      id: 1,
+      rings: [
+        [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }],
+        [{ x: 20, y: 23 }, { x: 80, y: 23 }, { x: 80, y: 73 }, { x: 20, y: 73 }],
+      ],
+      opens: [],
+      width: 100,
+      height: 100,
+      area: 100 * 100 - 60 * 50,
+      count: 5,
+    }
+    const { passes } = compareEngines([frame, rectPart(2, 55, 46, 5), rectPart(3, 12, 9, 40)], {
+      gap: 1.4,
+      margin: 0,
+      resolution: 1,
+      sheetWidth: 230,
+      sheetHeight: 160,
+      rotationStep: 90,
+      mirror: false,
+    })
+    expect(passes).toBeGreaterThan(1)
+  })
+
   it('matches the TS engine on the fan case fixture and packs 2 sheets', () => {
     const { entities } = parseDxf(fancaseDxf)
     resetPartIds()

@@ -226,6 +226,23 @@ pub fn dilate(src: &BitGrid, g: usize) -> BitGrid {
     out
 }
 
+/// Vertical erosion for banded fit scanning: row j is the AND of `src` rows
+/// j-st+1 .. j (rows below st-1 stay empty). See bandMask() in raster.ts.
+pub fn band_mask(src: &BitGrid, st: usize) -> BitGrid {
+    let mut out = BitGrid::new(src.w, src.h);
+    let words = src.words;
+    for y in st.saturating_sub(1)..src.h {
+        for i in 0..words {
+            let mut v = u32::MAX;
+            for k in 0..st {
+                v &= src.data[(y - k) * words + i];
+            }
+            out.data[y * words + i] = v;
+        }
+    }
+    out
+}
+
 /// Test whether `mask` placed with its origin at (ox, oy) overlaps set bits of `occ`.
 /// Returns 0 when free; on collision returns a skip distance d >= 1 such that
 /// placements at ox+1 .. ox+d-1 all collide too (see raster.ts for the proof).

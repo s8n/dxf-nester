@@ -9,7 +9,7 @@ import {
   runPassSpec,
 } from '../src/nest/nester'
 import type { NestPart, Placement } from '../src/nest/nester'
-import { BitGrid, collide, overlapCount } from '../src/nest/raster'
+import { BitGrid, bandMask, collide, overlapCount } from '../src/nest/raster'
 import type { Pt } from '../src/geom'
 
 function rectPart(id: number, w: number, h: number, count = 1): NestPart {
@@ -55,6 +55,32 @@ const baseOpts = {
   rotationStep: 90,
   mirror: false,
 }
+
+describe('bandMask', () => {
+  it('only rejects band positions where every row collides', () => {
+    let seed = 7
+    const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32)
+    for (let trial = 0; trial < 40; trial++) {
+      const mask = new BitGrid(5 + Math.floor(rnd() * 40), 3 + Math.floor(rnd() * 20))
+      for (let y = 0; y < mask.h; y++) for (let x = 0; x < mask.w; x++) if (rnd() < 0.8) mask.set(x, y)
+      const occ = new BitGrid(90, 60)
+      for (let i = 0; i < 12; i++) occ.set(Math.floor(rnd() * 90), Math.floor(rnd() * 60))
+      const st = 1 + Math.floor(rnd() * 8)
+      const band = bandMask(mask, st)
+      for (let oy = 0; oy + mask.h + st - 1 <= occ.h; oy++) {
+        for (let ox = 0; ox + mask.w <= occ.w; ox++) {
+          const d = collide(occ, band, ox, oy)
+          if (d === 0) continue
+          for (let k = 0; k < st; k++) {
+            for (let j = 0; j < d; j++) {
+              if (ox + j + mask.w <= occ.w) expect(collide(occ, mask, ox + j, oy + k)).toBeGreaterThan(0)
+            }
+          }
+        }
+      }
+    }
+  })
+})
 
 describe('overlapCount', () => {
   it('counts coinciding bits across word boundaries', () => {
@@ -298,6 +324,59 @@ describe('nest', () => {
       if (betterPass(pass, best)) best = pass
     }
     expect(finalizeNest(ctx, best)).toEqual(direct)
+  })
+
+  // findFit used to test only every st-th row (st up to 8), so a slot a few
+  // rows tall between tested rows was never found.
+  it('finds a tight hole between coarse scan rows', () => {
+    const frame: NestPart = {
+      id: 1,
+      rings: [
+        [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }],
+        [{ x: 20, y: 23 }, { x: 80, y: 23 }, { x: 80, y: 73 }, { x: 20, y: 73 }],
+      ],
+      opens: [],
+      width: 100,
+      height: 100,
+      area: 100 * 100 - 60 * 50,
+      count: 1,
+    }
+    const insert = rectPart(2, 55, 46)
+    const opts = { ...baseOpts, gap: 0, resolution: 1, sheetWidth: 102, sheetHeight: 102, rotationStep: 0 }
+    const res = nest([frame, insert], opts)
+    expect(res.sheets).toHaveLength(1)
+    const b = placedBBox(insert, res.placements.find((pl) => pl.partId === 2)!)
+    expect(b.minY).toBeGreaterThanOrEqual(23)
+    expect(b.maxY).toBeLessThanOrEqual(73)
+  })
+
+  // ...and rows between the last coarse row and the height limit were skipped,
+  // opening an extra sheet for a part that fits in the top strip.
+  it('fits a part into the top strip under the height limit', () => {
+    const lShape: NestPart = {
+      id: 1,
+      rings: [[{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 55 }, { x: 20, y: 55 }, { x: 20, y: 98 }, { x: 0, y: 98 }]],
+      opens: [],
+      width: 100,
+      height: 98,
+      area: 100 * 55 + 20 * 43,
+      count: 1,
+    }
+    const opts = { ...baseOpts, gap: 0, resolution: 1, sheetWidth: 102, sheetHeight: 100, rotationStep: 0 }
+    const res = nest([lShape, rectPart(2, 50, 40)], opts)
+    expect(res.failures).toHaveLength(0)
+    expect(res.sheets).toHaveLength(1)
+  })
+
+  it('never rounds the pixel gap below the requested gap', () => {
+    // At 1 unit/px a 1.4 gap used to round to 1 px; with this part width the
+    // real clearance then came out at 1.01.
+    const part = rectPart(1, 9.99, 10, 2)
+    const res = nest([part], { ...baseOpts, gap: 1.4, resolution: 1, sheetWidth: 25, rotationStep: 0 })
+    expect(res.placements).toHaveLength(2)
+    const [a, b] = res.placements.map((pl) => placedBBox(part, pl))
+    const sep = Math.max(b.minX - a.maxX, a.minX - b.maxX, b.minY - a.maxY, a.minY - b.maxY)
+    expect(sep).toBeGreaterThanOrEqual(1.4)
   })
 
   it('reports parts too big for the workpiece', () => {

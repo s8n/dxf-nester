@@ -416,23 +416,32 @@ function startNest(): void {
     return
   }
   const stage1 = planStage1(ctx)
-  const poolSize = Math.max(1, Math.min((navigator.hardwareConcurrency || 4) - 1, 8, stage1.length))
   const pool: Worker[] = []
-  for (let i = 0; i < poolSize; i++) {
-    const w = new NestWorker()
-    w.onmessage = (ev: MessageEvent<WorkerResponse>) => {
-      if (ev.data.type === 'ready') state.engine = ev.data.engine
+  // Workers are spawned per stage as needed: stage 2 can plan more passes than
+  // stage 1, and each worker holds its own mask cache, so don't start idle ones.
+  const growPool = (specs: number): void => {
+    const want = Math.max(1, Math.min(maxWorkers(), specs))
+    while (pool.length < want) {
+      const w = new NestWorker()
+      w.onmessage = (ev: MessageEvent<WorkerResponse>) => {
+        if (ev.data.type === 'ready') state.engine = ev.data.engine
+      }
+      w.postMessage({ kind: 'init', parts: nestParts, opts } satisfies WorkerRequest)
+      pool.push(w)
     }
-    w.postMessage({ kind: 'init', parts: nestParts, opts } satisfies WorkerRequest)
-    pool.push(w)
   }
+  growPool(stage1.length)
   state.pool = pool
   els.nestBtn.disabled = true
   els.cancelBtn.hidden = false
   els.busy.hidden = false
   els.progress.hidden = false
   els.progress.value = 0
-  void orchestrateNest(ctx, stage1, pool, performance.now())
+  void orchestrateNest(ctx, stage1, pool, growPool, performance.now())
+}
+
+function maxWorkers(): number {
+  return Math.max(1, Math.min((navigator.hardwareConcurrency || 4) - 1, 8))
 }
 
 /**
@@ -440,7 +449,13 @@ function startNest(): void {
  * spec order (deterministic — identical to the sequential nest() driver), plan
  * the balanced stage-2 passes from it, run those, finalize.
  */
-async function orchestrateNest(ctx: NestContext, stage1: PassSpec[], pool: Worker[], t0: number): Promise<void> {
+async function orchestrateNest(
+  ctx: NestContext,
+  stage1: PassSpec[],
+  pool: Worker[],
+  growPool: (specs: number) => void,
+  t0: number
+): Promise<void> {
   const fractions: number[] = []
   let totalPasses = stage1.length
   const showProgress = () => {
@@ -454,6 +469,7 @@ async function orchestrateNest(ctx: NestContext, stage1: PassSpec[], pool: Worke
     const stage2 = planBalanced(ctx, best)
     if (stage2.length > 0) {
       totalPasses += stage2.length
+      growPool(stage2.length)
       const r2 = await runSpecsOnPool(pool, stage2, stage1.length, fractions, showProgress)
       if (state.pool !== pool) return
       for (const pass of r2) if (betterPass(pass, best)) best = pass

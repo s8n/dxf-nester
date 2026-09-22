@@ -4,7 +4,7 @@
 //! PassSpecs whose `order` indexes into the instance list, so the context here
 //! must derive the exact same deterministic instance ordering as the TS side.
 
-use crate::grid::{collide, dilate, or_into, overlap_count, rasterize, BitGrid, Pt as GPt};
+use crate::grid::{band_mask, collide, dilate, or_into, overlap_count, rasterize, BitGrid, Pt as GPt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -97,6 +97,9 @@ struct Mask {
     theta: f64,
     mirror: bool,
     dilated: Option<BitGrid>,
+    /// find_fit() row band height and the matching band_mask() of `grid`.
+    st: usize,
+    band: BitGrid,
     /// Mask dilated by gap+1 px: the "contact zone" stamped into Sheet.occ_c.
     dilated_c: Option<BitGrid>,
 }
@@ -107,6 +110,8 @@ struct Sheet {
     contact_rows: usize,
     /// First empty nest-space row (px): all rows >= top_nest are guaranteed free.
     top_nest: usize,
+    /// Last find_fit() result per mask index (see `fits` in nester.ts).
+    fits: HashMap<usize, Option<(usize, usize)>>,
     used_w_u: f64,
     used_h_u: f64,
     placed: u32,
@@ -186,7 +191,8 @@ impl NestContext {
 
         let inner_w = crate::grid::js_round(inner_w_u * scale).max(1.0) as usize;
         let inner_h = inner_h_u.map(|h| (h * scale).floor().max(1.0) as usize);
-        let gap_px = crate::grid::js_round(opts.gap * scale).max(0.0) as usize;
+        // Round up so the pixel gap never undercuts the requested clearance.
+        let gap_px = (opts.gap * scale - 1e-9).ceil().max(0.0) as usize;
         let pad = gap_px;
         let pad_c = pad + 1;
 
@@ -344,6 +350,8 @@ fn build_mask(p: &NestPart, theta: f64, mirror: bool, scale: f64) -> Option<Mask
         return None; // pathological resolution/part combination
     }
     let grid = rasterize(&rings, &opens, scale, w, h);
+    let st = (w.min(h) / 6).clamp(1, 8);
+    let band = band_mask(&grid, st);
     Some(Mask {
         grid,
         w,
@@ -355,14 +363,33 @@ fn build_mask(p: &NestPart, theta: f64, mirror: bool, scale: f64) -> Option<Mask
         theta,
         mirror,
         dilated: None,
+        st,
+        band,
         dilated_c: None,
     })
 }
 
-/// Bottom-left first fit: scan upward with a coarse row stride, then refine the
-/// band. collide()'s skip distances only jump over positions proven to collide,
-/// so narrow slots are never skipped over.
-fn find_fit(sheet: &mut Sheet, mask: &Mask, inner_w: usize, inner_h: Option<usize>, pad: usize) -> Option<(usize, usize)> {
+/// Leftmost free x >= x0 in row y (see find_fit).
+fn scan_row(occ: &BitGrid, mask: &Mask, max_x: usize, pad: usize, y: usize, x0: usize) -> Option<usize> {
+    let mut x = x0;
+    while x <= max_x {
+        let d = collide(occ, &mask.grid, x + pad, y + pad);
+        if d == 0 {
+            return Some(x);
+        }
+        x += d;
+    }
+    None
+}
+
+/// Bottom-left first fit: the lowest row, then leftmost column, where the mask
+/// is free. Rows go in bands of mask.st: sweeping the band mask proves every
+/// position it rejects collides on all rows of the band, and a band with any
+/// free position is refined row by row. collide()'s skip distances only jump
+/// over positions proven to collide, so narrow slots are never skipped over.
+/// Row top_nest is always free at x = 0, so the scan ends there at the latest.
+/// Resumes from the mask's previous fit on this sheet (see `Sheet::fits`).
+fn find_fit(sheet: &mut Sheet, mi: usize, mask: &Mask, inner_w: usize, inner_h: Option<usize>, pad: usize) -> Option<(usize, usize)> {
     if mask.w > inner_w {
         return None;
     }
@@ -376,47 +403,47 @@ fn find_fit(sheet: &mut Sheet, mask: &Mask, inner_w: usize, inner_h: Option<usiz
         }
         None => None,
     };
+    let prev = match sheet.fits.get(&mi) {
+        Some(None) => return None,
+        Some(Some(p)) => Some(*p),
+        None => None,
+    };
     let scan_top = match y_limit {
         Some(yl) => sheet.top_nest.min(yl),
         None => sheet.top_nest,
     };
-    let st = (mask.w.min(mask.h) / 6).clamp(1, 8);
+    let mut found: Option<(usize, usize)> = None;
     let mut y = 0usize;
-    while y <= scan_top {
-        sheet.occ.ensure_rows(y + pad + mask.h);
+    if let Some((px, py)) = prev {
+        sheet.occ.ensure_rows(py + pad + mask.h);
+        found = scan_row(&sheet.occ, mask, max_x, pad, py, px).map(|x| (x, py));
+        y = py + 1;
+    }
+    while found.is_none() && y <= scan_top {
+        let end = (y + mask.st - 1).min(scan_top);
+        sheet.occ.ensure_rows(end + pad + mask.h);
         let mut x = 0usize;
         while x <= max_x {
-            let d = collide(&sheet.occ, &mask.grid, x + pad, y + pad);
+            let d = collide(&sheet.occ, &mask.band, x + pad, y + pad);
             if d == 0 {
-                // Found room in this band — refine to the lowest-left position inside it.
-                let mut fy = y.saturating_sub(st - 1);
-                while fy < y {
-                    let mut fx = 0usize;
-                    while fx <= max_x {
-                        let fd = collide(&sheet.occ, &mask.grid, fx + pad, fy + pad);
-                        if fd == 0 {
-                            return Some((fx, fy));
-                        }
-                        fx += fd;
-                    }
+                // Everything left of x collides on every band row.
+                let mut fy = y;
+                while fy <= end && found.is_none() {
+                    found = scan_row(&sheet.occ, mask, max_x, pad, fy, x).map(|fx| (fx, fy));
                     fy += 1;
                 }
-                return Some((x, y));
+                break;
             }
             x += d;
         }
-        y += st;
+        y = end + 1;
     }
-    // Nothing inside the used region — place on top if the height limit allows.
-    if y_limit.map_or(true, |yl| sheet.top_nest <= yl) {
-        sheet.occ.ensure_rows(sheet.top_nest + pad + mask.h);
-        return Some((0, sheet.top_nest));
-    }
-    None
+    sheet.fits.insert(mi, found);
+    found
 }
 
 fn new_sheet(ctx: &NestContext) -> Sheet {
-    let mut occ_c = BitGrid::new(ctx.inner_w + 2 * ctx.pad_c, 128);
+    let mut occ_c = BitGrid::new(ctx.inner_w + 2 * ctx.pad_c, (ctx.pad_c + 1).max(128));
     // Sheet floor counts as contact.
     for y in 0..=ctx.pad_c {
         let w = occ_c.w;
@@ -427,6 +454,7 @@ fn new_sheet(ctx: &NestContext) -> Sheet {
         occ_c,
         contact_rows: 0,
         top_nest: 0,
+        fits: HashMap::new(),
         used_w_u: 0.0,
         used_h_u: 0.0,
         placed: 0,
@@ -492,7 +520,7 @@ pub fn run_pass<F: FnMut(usize, usize)>(ctx: &mut NestContext, spec: &PassSpec, 
                 let Some(mi) = ctx.get_mask(pi, rot, mir) else { continue };
                 let (inner_w, inner_h, pad, pad_c) = (ctx.inner_w, ctx.inner_h, ctx.pad, ctx.pad_c);
                 let mask = &ctx.masks[mi];
-                let Some((x, y)) = find_fit(sheet, mask, inner_w, inner_h, pad) else { continue };
+                let Some((x, y)) = find_fit(sheet, mi, mask, inner_w, inner_h, pad) else { continue };
                 if policy == Policy::Contact {
                     ensure_contact(sheet, y + pad_c + mask.h, pad_c, inner_w);
                     let c = overlap_count(&sheet.occ_c, &mask.grid, x + pad_c, y + pad_c) as i64;

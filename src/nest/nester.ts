@@ -1,5 +1,5 @@
 import type { Pt } from '../geom'
-import { BitGrid, collide, dilate, orInto, overlapCount, rasterize } from './raster'
+import { BitGrid, bandMask, collide, dilate, orInto, overlapCount, rasterize } from './raster'
 
 export interface NestPart {
   id: number
@@ -66,6 +66,9 @@ interface Mask {
   theta: number
   mirror: boolean
   dilated: BitGrid | null
+  /** findFit() row band height and the matching bandMask() of `grid`. */
+  st: number
+  band: BitGrid
   /** Mask dilated by gap+1 px: the "contact zone" stamped into Sheet.occC. */
   dilatedC: BitGrid | null
 }
@@ -78,6 +81,10 @@ interface Sheet {
   contactRows: number
   /** First empty nest-space row (px): all rows >= topNest are guaranteed free. */
   topNest: number
+  /** Last findFit() result per mask. Occupancy only grows within a pass, so a
+   * mask's lowest-left fit never moves down or left: later scans resume here,
+   * and a null (no room under the height limit) stays null. */
+  fits: Map<Mask, { x: number; y: number } | null>
   usedWU: number
   usedHU: number
   placed: number
@@ -189,7 +196,8 @@ export function createNestContext(parts: NestPart[], opts: NestOptions): NestCon
 
   const innerW = Math.max(1, Math.round(innerWU * scale))
   const innerH = innerHU != null ? Math.max(1, Math.floor(innerHU * scale)) : null
-  const gapPx = Math.max(0, Math.round(opts.gap * scale))
+  // Round up so the pixel gap never undercuts the requested clearance.
+  const gapPx = Math.max(0, Math.ceil(opts.gap * scale - 1e-9))
   const pad = gapPx
   // The contact grid uses one extra pad pixel so a mask's cells can coincide with
   // zones dilated one px past the gap: overlap there = "touching across the gap".
@@ -329,7 +337,7 @@ export function runPassSpec(ctx: NestContext, spec: PassSpec, onProgress?: Progr
   const assign = spec.assign
 
   const newSheet = (): Sheet => {
-    const occC = new BitGrid(innerW + 2 * PADC, 128)
+    const occC = new BitGrid(innerW + 2 * PADC, Math.max(128, PADC + 1))
     // Sheet floor counts as contact.
     for (let y = 0; y <= PADC; y++) occC.fillSpan(y, 0, occC.w - 1)
     return {
@@ -337,6 +345,7 @@ export function runPassSpec(ctx: NestContext, spec: PassSpec, onProgress?: Progr
       occC,
       contactRows: 0,
       topNest: 0,
+      fits: new Map(),
       usedWU: 0,
       usedHU: 0,
       placed: 0,
@@ -607,14 +616,20 @@ function buildMask(p: NestPart, theta: number, mirror: boolean, scale: number): 
   const h = Math.max(1, Math.ceil(hU * scale) + 1)
   if (w * h > 64_000_000) return null // pathological resolution/part combination
   const grid = rasterize(rings, opens, scale, w, h)
-  return { grid, w, h, offX: minX, offY: minY, wU, hU, theta, mirror, dilated: null, dilatedC: null }
+  const st = Math.max(1, Math.min(8, Math.floor(Math.min(w, h) / 6)))
+  const band = bandMask(grid, st)
+  return { grid, w, h, offX: minX, offY: minY, wU, hU, theta, mirror, dilated: null, st, band, dilatedC: null }
 }
 
 /**
- * Bottom-left first fit: scan upward with a coarse row stride, then refine the band.
- * Rows are scanned exhaustively in x — collide()'s skip distances only jump over
- * positions proven to collide — so narrow slots, e.g. a snug pocket inside
- * another part, are never skipped over.
+ * Bottom-left first fit: the lowest row, then leftmost column, where the mask is
+ * free. Rows go in bands of mask.st: sweeping the band mask proves every
+ * position it rejects collides on all rows of the band, and a band with any
+ * free position is refined row by row. Rows are scanned exhaustively in x —
+ * collide()'s skip distances only jump over positions proven to collide — so
+ * narrow slots, e.g. a snug pocket inside another part, are never skipped
+ * over. Row topNest is always free at x = 0, so the scan ends there at the
+ * latest. Resumes from the mask's previous fit on this sheet (see Sheet.fits).
  * Returns nest-space pixel coords, or null if the mask cannot fit (height limit).
  */
 function findFit(sheet: Sheet, mask: Mask, innerW: number, innerH: number | null, PAD: number): { x: number; y: number } | null {
@@ -622,31 +637,44 @@ function findFit(sheet: Sheet, mask: Mask, innerW: number, innerH: number | null
   if (maxX < 0) return null
   const yLimit = innerH != null ? innerH - mask.h : Infinity
   if (yLimit < 0) return null
+  const prev = sheet.fits.get(mask)
+  if (prev === null) return null
   const scanTop = Math.min(sheet.topNest, yLimit)
-  const st = Math.max(1, Math.min(8, Math.floor(Math.min(mask.w, mask.h) / 6)))
   const occ = sheet.occ
-  for (let y = 0; y <= scanTop; y += st) {
-    occ.ensureRows(y + PAD + mask.h)
-    for (let x = 0; x <= maxX; ) {
+  // Leftmost free x >= x0 in row y, or -1.
+  const scanRow = (y: number, x0: number): number => {
+    for (let x = x0; x <= maxX; ) {
       const d = collide(occ, mask.grid, x + PAD, y + PAD)
+      if (d === 0) return x
+      x += d
+    }
+    return -1
+  }
+  let found: { x: number; y: number } | null = null
+  let y = 0
+  if (prev) {
+    occ.ensureRows(prev.y + PAD + mask.h)
+    const x = scanRow(prev.y, prev.x)
+    if (x >= 0) found = { x, y: prev.y }
+    y = prev.y + 1
+  }
+  while (!found && y <= scanTop) {
+    const end = Math.min(y + mask.st - 1, scanTop)
+    occ.ensureRows(end + PAD + mask.h)
+    for (let x = 0; x <= maxX; ) {
+      const d = collide(occ, mask.band, x + PAD, y + PAD)
       if (d === 0) {
-        // Found room in this band — refine to the lowest-left position inside it.
-        for (let fy = Math.max(0, y - st + 1); fy < y; fy++) {
-          for (let fx = 0; fx <= maxX; ) {
-            const fd = collide(occ, mask.grid, fx + PAD, fy + PAD)
-            if (fd === 0) return { x: fx, y: fy }
-            fx += fd
-          }
+        // Everything left of x collides on every band row.
+        for (let fy = y; fy <= end && !found; fy++) {
+          const fx = scanRow(fy, x)
+          if (fx >= 0) found = { x: fx, y: fy }
         }
-        return { x, y }
+        break
       }
       x += d
     }
+    y = end + 1
   }
-  // Nothing inside the used region — place on top if the height limit allows.
-  if (sheet.topNest <= yLimit) {
-    occ.ensureRows(sheet.topNest + PAD + mask.h)
-    return { x: 0, y: sheet.topNest }
-  }
-  return null
+  sheet.fits.set(mask, found)
+  return found
 }

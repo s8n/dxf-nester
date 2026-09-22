@@ -188,6 +188,26 @@ export function dilate(src: BitGrid, g: number): BitGrid {
 }
 
 /**
+ * Vertical erosion for banded fit scanning: row j is the AND of `src` rows
+ * j-st+1 .. j (rows below st-1 stay empty). Every set cell of the result sits
+ * on a set cell of `src` shifted down by each of 0 .. st-1 rows, so if it
+ * collides at (ox, oy) then `src` collides at every (ox, oy .. oy+st-1) — and
+ * collide()'s skip distances carry over to the whole band.
+ */
+export function bandMask(src: BitGrid, st: number): BitGrid {
+  const out = new BitGrid(src.w, src.h)
+  const words = src.words
+  for (let y = st - 1; y < src.h; y++) {
+    for (let i = 0; i < words; i++) {
+      let v = 0xffffffff
+      for (let k = 0; k < st; k++) v &= src.data[(y - k) * words + i]
+      out.data[y * words + i] = v
+    }
+  }
+  return out
+}
+
+/**
  * Test whether `mask` placed with its origin at (ox, oy) overlaps set bits of `occ`.
  * Requires 0 <= ox, ox + mask.w <= occ.w, and occ.h >= oy + mask.h.
  *
